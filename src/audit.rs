@@ -50,11 +50,35 @@ fn try_record(
     command: Option<&str>,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
     let dir = audit_dir().context("could not determine audit directory")?;
-    std::fs::create_dir_all(&dir)?;
+    try_record_to(&dir, op, reference, outcome, ttl_remaining, command)
+}
+
+fn try_record_to(
+    dir: &std::path::Path,
+    op: &'static str,
+    reference: Option<&str>,
+    outcome: &'static str,
+    ttl_remaining: Option<u64>,
+    command: Option<&str>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })?;
+    // Converge pre-existing directories created before the 0700 policy.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -272,6 +296,24 @@ mod tests {
         assert_eq!(summary.by_outcome.get("fetched"), Some(&1));
         assert_eq!(summary.by_reference.get("op://a/b/c"), Some(&2));
         assert_eq!(summary.by_reference.get("op://d/e/f"), Some(&1));
+    }
+
+    #[test]
+    fn audit_dir_and_log_file_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("op-fast-audit-test-{}", std::process::id()));
+        let dir = base.join("audit");
+        try_record_to(&dir, "read", Some("op://t/t/t"), "hit", Some(1), None).unwrap();
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        let entry = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap();
+        let file_mode = entry.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
