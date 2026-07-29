@@ -65,6 +65,7 @@ pub fn execute(cmd: StoreCommand) -> Result<()> {
         StoreSubcommand::Clear { reference } => match reference {
             Some(ref_str) => {
                 let deleted = store.delete(&ref_str)?;
+                crate::audit::record("store", Some(&ref_str), "cleared", None, None);
                 if deleted {
                     println!("Deleted: {}", ref_str);
                 } else {
@@ -73,6 +74,7 @@ pub fn execute(cmd: StoreCommand) -> Result<()> {
             }
             None => {
                 store.clear()?;
+                crate::audit::record("store", None, "cleared-all", None, None);
                 println!("Store cleared");
             }
         },

@@ -114,8 +114,15 @@ pub fn execute(args: InjectArgs) -> Result<()> {
         match &store {
             Ok(store) => {
                 for ref_str in &references {
-                    match store.get(ref_str)? {
-                        Some(value) => {
+                    match store.get_with_meta(ref_str)? {
+                        Some((value, meta)) => {
+                            crate::audit::record(
+                                "inject",
+                                Some(ref_str),
+                                "hit",
+                                Some(meta.remaining_secs()),
+                                None,
+                            );
                             stored_values.insert(ref_str.clone(), value);
                         }
                         None => {
@@ -132,7 +139,12 @@ pub fn execute(args: InjectArgs) -> Result<()> {
 
         if !uncached_refs.is_empty() {
             log::debug!("Fetching {} uncached references", uncached_refs.len());
-            let fetched = delegate.read_batch(&uncached_refs)?;
+            let fetched = delegate.read_batch(&uncached_refs).inspect_err(|_| {
+                crate::audit::record("inject", None, "error", None, None);
+            })?;
+            for ref_str in &uncached_refs {
+                crate::audit::record("inject", Some(ref_str), "fetched", None, None);
+            }
 
             if let Ok(store) = &store {
                 for (ref_str, value) in &fetched {

@@ -65,11 +65,11 @@ impl Store {
         Ok(store)
     }
 
-    pub fn get(&self, reference: &str) -> anyhow::Result<Option<String>> {
+    pub fn get_with_meta(&self, reference: &str) -> anyhow::Result<Option<(String, Meta)>> {
         match self.db.get(reference)? {
-            Some(value) => {
+            Some(entry) => {
                 log::debug!("Store hit for: {}", reference);
-                Ok(Some(value))
+                Ok(Some(entry))
             }
             None => {
                 log::debug!("Store miss for: {}", reference);

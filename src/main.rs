@@ -1,5 +1,6 @@
 use clap::Parser;
 
+mod audit;
 mod command;
 mod config;
 mod delegate;

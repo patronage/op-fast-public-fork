@@ -35,6 +35,14 @@ impl Meta {
             .as_secs();
         now > self.stored_at + self.ttl_seconds
     }
+
+    pub fn remaining_secs(&self) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        (self.stored_at + self.ttl_seconds).saturating_sub(now)
+    }
 }
 
 pub struct Db {
@@ -61,7 +69,7 @@ impl Db {
         Ok(Self { env, db })
     }
 
-    pub fn get(&self, reference: &str) -> Result<Option<String>> {
+    pub fn get(&self, reference: &str) -> Result<Option<(String, Meta)>> {
         let meta = {
             let rtxn = self.env.read_txn()?;
             let Some(meta) = self.db.get(&rtxn, reference)? else {
@@ -75,7 +83,7 @@ impl Db {
         }
 
         match Self::keyring_get(reference)? {
-            Some(value) => Ok(Some(value)),
+            Some(value) => Ok(Some((value, meta))),
             None => {
                 log::warn!(
                     "Store metadata exists but keyring value missing for: {}",

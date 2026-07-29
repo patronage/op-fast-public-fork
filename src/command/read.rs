@@ -71,11 +71,27 @@ pub fn execute(args: ReadArgs) -> Result<()> {
     let store = Store::open();
     let delegate = OpDelegate::new()?;
 
+    let fetch = |reference: &str| {
+        delegate.read(reference).inspect_err(|_| {
+            crate::audit::record("read", Some(reference), "error", None, None);
+        })
+    };
+
     let value = match store {
-        Ok(store) => match store.get(&args.reference)? {
-            Some(value) => value,
+        Ok(store) => match store.get_with_meta(&args.reference)? {
+            Some((value, meta)) => {
+                crate::audit::record(
+                    "read",
+                    Some(&args.reference),
+                    "hit",
+                    Some(meta.remaining_secs()),
+                    None,
+                );
+                value
+            }
             None => {
-                let value = delegate.read(&args.reference)?;
+                let value = fetch(&args.reference)?;
+                crate::audit::record("read", Some(&args.reference), "fetched", None, None);
                 let ttl = config.resolve_ttl(&args.reference);
                 store.put(&args.reference, &value, ttl)?;
                 value
@@ -83,7 +99,9 @@ pub fn execute(args: ReadArgs) -> Result<()> {
         },
         Err(e) => {
             log::error!("Store unavailable, delegating to op: {}", e);
-            delegate.read(&args.reference)?
+            let value = fetch(&args.reference)?;
+            crate::audit::record("read", Some(&args.reference), "fetched", None, None);
+            value
         }
     };
 

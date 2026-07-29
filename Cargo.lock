@@ -943,6 +943,7 @@ dependencies = [
  "humantime",
  "keyring-core",
  "lazy_static",
+ "libc",
  "linux-keyutils-keyring-store",
  "log",
  "serde",
