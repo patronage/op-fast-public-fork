@@ -77,6 +77,11 @@ fn try_record_to(
                 Err(e)
             }
         })?;
+    anyhow::ensure!(
+        dir.is_dir(),
+        "audit path exists but is not a directory: {}",
+        dir.display()
+    );
     // Converge pre-existing directories created before the 0700 policy.
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
 
@@ -312,6 +317,28 @@ mod tests {
         let entry = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap();
         let file_mode = entry.metadata().unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn record_fails_softly_when_audit_dir_is_occupied_by_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base =
+            std::env::temp_dir().join(format!("op-fast-audit-occupied-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let occupied = base.join("audit");
+        std::fs::write(&occupied, b"not a directory").unwrap();
+        std::fs::set_permissions(&occupied, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let result = try_record_to(&occupied, "read", Some("op://t/t/t"), "hit", None, None);
+        assert!(result.is_err());
+
+        // The unrelated file occupying the path must be left untouched.
+        let mode = std::fs::metadata(&occupied).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"not a directory");
 
         std::fs::remove_dir_all(&base).unwrap();
     }

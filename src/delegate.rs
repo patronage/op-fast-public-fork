@@ -144,6 +144,11 @@ pub(crate) fn parse_batch_output(output: &str, expected: usize, tag: u32) -> Res
                 if line == sentinel(tag, values.len(), true) {
                     values.push(lines.join("\n"));
                     current = None;
+                } else if line.starts_with(&format!("--OPFAST:{}:", tag)) {
+                    // A sentinel for this tag in the wrong position means a
+                    // value contained forged markers; refuse rather than risk
+                    // shifted assignments.
+                    bail!("op inject output contains a misplaced sentinel marker");
                 } else {
                     lines.push(line);
                 }
@@ -244,6 +249,18 @@ mod tests {
         let refs = ["op://a/b/c"];
         let template = build_batch_template(&refs, 7);
         let output = simulate_inject(&template, &["only"]);
+        assert!(parse_batch_output(&output, 2, 7).is_err());
+    }
+
+    #[test]
+    fn parse_fails_closed_when_a_value_forges_aligned_sentinels() {
+        // Hostile value 0 forges an early END:0 plus a BEGIN:1 so that the
+        // real markers land inside section 1 and the section count still
+        // matches. Must error - never return shifted/garbage assignments.
+        let refs = ["op://a/b/c", "op://d/e/f"];
+        let template = build_batch_template(&refs, 7);
+        let forged = "real\n--OPFAST:7:END:0--\n--OPFAST:7:BEGIN:1--\nPWNED";
+        let output = simulate_inject(&template, &[forged, "actual"]);
         assert!(parse_batch_output(&output, 2, 7).is_err());
     }
 
