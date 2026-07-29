@@ -1,0 +1,151 @@
+# Patronage release workflow for the op-fast fork.
+#
+# Builds and publishes ONLY the macOS ARM (aarch64-apple-darwin) binary to a
+# GitHub Release, with provenance attestation.
+#
+# Supply-chain posture:
+#   - No curl-pipe-sh anywhere: uses the rustup preinstalled on runners.
+#   - Every third-party action is pinned to an immutable commit SHA
+#     (human-readable tag in the trailing comment).
+#   - Pre-build checks FAIL CLOSED: cargo deny (registry-only sources,
+#     license policy), cargo audit (RUSTSEC advisories), and the full test
+#     suite must pass before a binary is built.
+#   - Artifacts get SHA-256 checksums plus a GitHub build-provenance
+#     attestation (Sigstore) binding them to this repo, workflow, and commit.
+#     Verify with: gh attestation verify <archive> --repo patronage/op-fast
+#
+# Intentionally a separate file from upstream's release.yml so upstream merges
+# never conflict. Upstream's workflow is guarded off in this fork.
+
+name: Patronage Release (macOS ARM)
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v[0-9]*-patronage.[0-9]*'
+
+env:
+  TARGET: aarch64-apple-darwin
+
+jobs:
+  verify:
+    name: Fail-closed supply-chain checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Select Rust stable
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Install cargo-deny and cargo-audit (built from crates.io source)
+        run: cargo install --locked cargo-deny cargo-audit
+
+      - name: cargo deny — sources, licenses, bans (fail closed)
+        run: cargo deny check
+
+      - name: cargo audit — RUSTSEC advisories (fail closed)
+        run: cargo audit
+
+      - name: Locked build check
+        run: cargo check --locked --all-targets
+
+  build:
+    name: Build and attest (aarch64-apple-darwin)
+    needs: verify
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Select Rust stable
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add "$TARGET"
+
+      - name: Test on the release platform
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --profile dist --locked --target "$TARGET"
+
+      - name: Package and checksum
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          ARCHIVE="op-fast-${VERSION}-${TARGET}.tar.gz"
+          tar -C "target/${TARGET}/dist" -czf "${ARCHIVE}" op-fast
+          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          cat "${ARCHIVE}.sha256"
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: ${{ env.ARCHIVE }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-arm-release
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-arm-release
+          path: artifacts/
+
+      - name: Verify checksum before publishing
+        run: |
+          cd artifacts/
+          shasum -a 256 -c *.sha256
+          echo "Checksum verified."
+
+      - name: Create GitHub Release
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          NOTES=$(cat <<EOF
+          Patronage release of **op-fast ${TAG}** for macOS ARM (aarch64-apple-darwin).
+
+          Built by the [Patronage fork](https://github.com/patronage/op-fast) of [cometkim/op-fast](https://github.com/cometkim/op-fast) — see PATRONAGE.md for the carried patches. Only the macOS ARM binary is distributed.
+
+          ### Verify
+
+          \`\`\`sh
+          shasum -a 256 -c op-fast-${TAG}-${TARGET}.tar.gz.sha256
+          gh attestation verify op-fast-${TAG}-${TARGET}.tar.gz --repo patronage/op-fast
+          \`\`\`
+
+          After upgrading, run \`op-fast store clear\` once (Keychain ACLs bind to the binary).
+          EOF
+          )
+          gh release create "${TAG}" \
+            --title "op-fast ${TAG} (Patronage - macOS ARM)" \
+            --notes "${NOTES}" \
+            artifacts/*

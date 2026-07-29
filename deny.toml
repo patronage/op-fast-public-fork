@@ -1,0 +1,34 @@
+# cargo-deny policy for the Patronage fork. Checked fail-closed in CI
+# before every release build (see .github/workflows/patronage-release.yml).
+
+[graph]
+# We ship exactly one target; don't police dependencies of platforms we
+# never build (e.g. the BSD-only dbus/openssl subtree).
+targets = ["aarch64-apple-darwin"]
+all-features = false
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+# Every dependency must come from crates.io. No git, no alternate registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

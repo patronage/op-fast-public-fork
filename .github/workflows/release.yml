@@ -47,6 +47,10 @@ on:
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    # Patronage fork: upstream's release pipeline only runs in the canonical
+    # repo. Releases here go through patronage-release.yml. This single guard
+    # cascades to every downstream job via `needs: plan`.
+    if: github.repository == 'cometkim/op-fast'
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
