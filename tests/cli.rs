@@ -127,12 +127,9 @@ impl Env {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(stdin.as_bytes())
-            .unwrap();
+        // The binary may exit before reading stdin (e.g. a validation
+        // error); a broken pipe here is not a test failure.
+        let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
         child.wait_with_output().unwrap()
     }
 
@@ -1146,7 +1143,12 @@ fn b1_signature_check_is_active_by_default_in_debug_builds() {
         .unwrap();
     assert!(!out.status.success());
     let err = stderr(&out);
-    assert!(err.contains("not signed by 1Password"), "{}", err);
+    let expected = if cfg!(target_os = "macos") {
+        "not signed by 1Password"
+    } else {
+        "only supported on macOS"
+    };
+    assert!(err.contains(expected), "{}", err);
     assert!(err.contains(env.fake.to_str().unwrap()), "{}", err);
     assert!(env.calls().is_empty(), "no delegate call may carry a token");
 
