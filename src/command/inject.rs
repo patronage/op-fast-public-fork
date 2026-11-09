@@ -100,7 +100,9 @@ pub fn execute(args: InjectArgs, sa: Option<&str>) -> Result<()> {
         }
     };
 
-    let resolved = template::resolve_variables(&input);
+    // Variables inside references must be set; elsewhere they expand
+    // leniently, as before.
+    let resolved = template::expand_text(&input, true)?;
 
     let references: Vec<String> = template::extract_references(&resolved)
         .into_iter()

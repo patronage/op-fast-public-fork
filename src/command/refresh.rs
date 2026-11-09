@@ -34,6 +34,9 @@ pub fn execute(args: RefreshArgs, sa: Option<&str>) -> Result<()> {
     if args.references.is_empty() && !args.all {
         bail!("give one or more references, or --all");
     }
+    for reference in &args.references {
+        crate::template::validate_reference(reference)?;
+    }
     let config = Config::load()?;
     let fetcher = Fetcher::new(&config, sa, "refresh")?;
     let refs = if args.all {

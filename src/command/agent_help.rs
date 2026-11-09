@@ -40,12 +40,14 @@ DO NOT
     commits, or files that are not mode 600.
   - guess at item names with spaces or slashes; use `op-fast ref`.
   - expect `op-fast run` to expand `$VAR` or references in arguments; only
-    environment values are resolved.
+    environment values are resolved. An unset $VAR inside a reference is
+    an error. Treat --env-file like code: it can build references.
 
 SERVICE ACCOUNTS
   References in vaults listed under [[service_account]] in config.toml are
   fetched with that account's token (no desktop prompt). Force one with
-  `--sa <name>` or OP_FAST_ACCOUNT; `--sa none` forces desktop auth.
+  `--sa <name>` or OP_FAST_ACCOUNT; `--sa none` always forces desktop
+  auth. On passthrough, `--vault` picks its account before a named --sa.
   Tokens go only to a 1Password-signed `op`, never to `op run` children.
 
 ESCAPE HATCHES

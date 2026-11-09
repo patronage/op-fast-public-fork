@@ -44,7 +44,9 @@ pub fn store_references(fetcher: &Fetcher, config: &Config) -> Result<(Vec<Strin
     let mut keep = Vec::new();
     let mut skipped = Vec::new();
     for (reference, meta) in store.list()? {
-        if !meta.is_expired() || meta.is_in_grace(config.stale_grace) {
+        if crate::template::validate_reference(&reference).is_err() {
+            skipped.push(reference);
+        } else if !meta.is_expired() || meta.is_in_grace(config.stale_grace) {
             keep.push(reference);
         } else {
             skipped.push(reference);

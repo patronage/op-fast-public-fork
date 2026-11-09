@@ -32,6 +32,9 @@ struct Row<'a> {
 }
 
 pub fn execute(args: StatusArgs, sa: Option<&str>) -> Result<()> {
+    for reference in &args.references {
+        crate::template::validate_reference(reference)?;
+    }
     let config = Config::load()?;
     let selector = Selector::new(&config, sa)?;
     let store = Store::open_read_only()?;

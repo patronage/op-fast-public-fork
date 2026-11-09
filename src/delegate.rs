@@ -23,6 +23,10 @@ pub const NETWORK_DEADLINE: Duration = Duration::from_secs(30);
 /// Incremented on every delegate child. A copy of op-fast that finds
 /// another op-fast copy on PATH would otherwise recurse forever.
 const DEPTH_ENV: &str = "OP_FAST_DELEGATE_DEPTH";
+/// Canonical paths of op-fast executables already on this delegate chain
+/// (PATH-list syntax). The PATH walk skips them, so two op-fast files on
+/// PATH cost one extra hop instead of a loop.
+const VISITED_ENV: &str = "OP_FAST_VISITED";
 const MAX_DEPTH: u32 = 6;
 
 /// Code-signing requirement a delegate must satisfy before op-fast hands it
@@ -156,12 +160,20 @@ impl OpDelegate {
             });
         }
 
+        let visited = visited_paths();
         for candidate in path_candidates(env::var_os("PATH").as_deref()) {
             let Ok(path) = candidate.canonicalize() else {
                 continue;
             };
             if me.as_ref() == Some(&path) {
                 log::debug!("Skipping {} (it is op-fast itself)", candidate.display());
+                continue;
+            }
+            if visited.contains(&path) {
+                log::debug!(
+                    "Skipping {} (already on this delegate chain)",
+                    candidate.display()
+                );
                 continue;
             }
             return Ok(Self {
@@ -205,6 +217,15 @@ impl OpDelegate {
     pub fn command(&self) -> Command {
         let mut cmd = Command::new(&self.command);
         cmd.env(DEPTH_ENV, (current_depth() + 1).to_string());
+        let mut visited = visited_paths();
+        if let Ok(me) = env::current_exe().and_then(fs::canonicalize)
+            && !visited.contains(&me)
+        {
+            visited.push(me);
+        }
+        if let Ok(joined) = env::join_paths(&visited) {
+            cmd.env(VISITED_ENV, joined);
+        }
         cmd
     }
 
@@ -225,9 +246,14 @@ impl OpDelegate {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Own process group, so a deadline kill takes grandchildren too.
-            .process_group(0);
+            .stderr(Stdio::piped());
+        // Unattended (stderr not a TTY): own process group, so a deadline
+        // kill takes grandchildren too. On a TTY the child stays in the
+        // foreground group so an interactive `op` prompt can read /dev/tty.
+        let own_group = !std::io::stderr().is_terminal();
+        if own_group {
+            cmd.process_group(0);
+        }
 
         let mut child = cmd.spawn().context("Failed to execute `op`")?;
         let pgid = child.id() as libc::pid_t;
@@ -249,8 +275,10 @@ impl OpDelegate {
                 break status.code();
             }
             if start.elapsed() >= deadline {
-                unsafe {
-                    libc::killpg(pgid, libc::SIGKILL);
+                if own_group {
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
                 }
                 let _ = child.kill();
                 let _ = child.wait();
@@ -391,13 +419,6 @@ impl OpDelegate {
     }
 }
 
-/// Per-process cache of signature results, keyed by delegate path.
-fn signature_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, bool>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, bool>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default)
-}
-
 /// Debug builds only: tests use a fake (unsigned) `op`, so they may opt out
 /// of the signature check. Release builds compile this to `false`.
 fn signature_check_skipped() -> bool {
@@ -413,37 +434,16 @@ fn signature_check_skipped() -> bool {
 /// Verify that `path` is the genuine 1Password CLI before it may receive a
 /// service-account token.
 pub fn verify_signature(path: &Path) -> Result<()> {
-    if signature_check_skipped() {
-        return Ok(());
-    }
-    if !cfg!(target_os = "macos") {
+    if !cfg!(target_os = "macos") && !signature_check_skipped() {
         bail!(
             "service-account tokens are only supported on macOS for now; refusing to pass a token to {}",
             path.display()
         );
     }
-    let cached = signature_cache()
-        .lock()
-        .ok()
-        .and_then(|c| c.get(path).copied());
-    let ok = match cached {
-        Some(ok) => ok,
-        None => {
-            let ok = Command::new("/usr/bin/codesign")
-                .arg("--verify")
-                .arg(format!("-R={}", OP_SIGNING_REQUIREMENT))
-                .arg(path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            if let Ok(mut c) = signature_cache().lock() {
-                c.insert(path.to_path_buf(), ok);
-            }
-            ok
-        }
-    };
+    // No cache: verify right before every token-bearing spawn, so a binary
+    // swapped after an earlier check is caught. (A same-user process can
+    // still swap the file between this check and the exec.)
+    let ok = run_codesign(path);
     if !ok {
         bail!(
             "refusing to pass a service-account token to {}: it is not signed by 1Password (AgileBits, team 2BUA8C4S2C)",
@@ -451,6 +451,36 @@ pub fn verify_signature(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn visited_paths() -> Vec<PathBuf> {
+    env::var_os(VISITED_ENV)
+        .map(|v| env::split_paths(&v).filter(|p| p.is_absolute()).collect())
+        .unwrap_or_default()
+}
+
+/// One signature verification. Debug builds with the test escape log the
+/// call (so tests can count verifications) and pass.
+fn run_codesign(path: &Path) -> bool {
+    if signature_check_skipped() {
+        #[cfg(debug_assertions)]
+        if let Some(log) = std::env::var_os("OP_FAST_TEST_SIGNATURE_LOG") {
+            use std::io::Write as _;
+            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(log) {
+                let _ = writeln!(f, "{}", path.display());
+            }
+        }
+        return true;
+    }
+    Command::new("/usr/bin/codesign")
+        .arg("--verify")
+        .arg(format!("-R={}", OP_SIGNING_REQUIREMENT))
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn current_depth() -> u32 {

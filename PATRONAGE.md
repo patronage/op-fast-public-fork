@@ -32,12 +32,16 @@ Added in `0.2.0-patronage.1` (safe to install as the machine-wide `op`):
    selection; tokens only in the OS keyring (`op-fast sa add|list|remove`),
    handed to one delegate child via `OP_SERVICE_ACCOUNT_TOKEN`, and only
    when that delegate passes `codesign --verify` against the AgileBits
-   (team `2BUA8C4S2C`) requirement. Passthrough gives a token only to an
-   allowlist of non-executing subcommands; passthrough `op run` under an
+   (team `2BUA8C4S2C`) requirement, checked uncached immediately before
+   every token-bearing spawn. A same-user process that can write the `op`
+   binary can still swap it between that check and the exec. Passthrough gives a token only to an
+   allowlist of non-executing subcommands, in a strict argv shape (the
+   subcommand first, no flag before it or its sub-subcommand, no bare
+   `run`/`plugin`); passthrough `op run` under an
    account is refused. Non-macOS: tokens refused for now.
 6. **Fail fast** — delegate deadlines (60 s with a TTY, `prompt_timeout`
    otherwise, minimum 1 s; 30 s for service accounts), killing the whole
-   process group; exit 75 with one `op-fast: needs approval:` line when
+   process group when unattended and the direct child on a TTY; exit 75 with one `op-fast: needs approval:` line when
    nothing can be served.
 7. **Stale on auth failure** — expired entries kept for `stale_grace`
    (default 30 days) and served with a warning only when a desktop call's
@@ -51,8 +55,15 @@ Added in `0.2.0-patronage.1` (safe to install as the machine-wide `op`):
    op-fast itself (so an `op` symlink works and `./op` never does);
    invoked as `op`, `--version`/`--help`/bare go to real `op`; delegate
    recursion guard; `OP_FAST_BYPASS=1` (op-fast-only commands stay local).
-   `run` expands variables before resolving references and never touches
-   argv; masked output is byte-exact.
+   `run` expands variables before resolving references (unset variables in
+   a reference are errors; `--env-file` values expand, inherited values
+   without references stay byte-identical) and never touches argv; masked
+   output is byte-exact, multi-line secrets are masked per line, and a
+   signal-killed child exits `128 + signal`. References reject control
+   characters and never span a newline. A hostile `--env-file` can build a
+   reference from environment values, which is then sent to `op` and
+   logged locally. Cache keys must be `op://` references, and the keyring
+   service names are compile-time constants in release builds.
 9. **Agent-facing surface** — all commands visible in `--help`;
    `agent-help`, `doctor`, `status`, `ref`; `store list --json`,
    `audit summary --json`.
@@ -60,7 +71,8 @@ Added in `0.2.0-patronage.1` (safe to install as the machine-wide `op`):
     `tests/fake-op.sh` with an isolated store, config, and (debug builds
     only) a directory-backed keyring, so tests never touch the real
     Keychain or 1Password. Debug-only escapes (`OP_FAST_TEST_KEYRING_DIR`,
-    `OP_FAST_TEST_UNSIGNED_DELEGATE`, `OP_FAST_TEST_FORCE_GC`) sit behind
+    `OP_FAST_KEYRING_SERVICE`, `OP_FAST_TEST_UNSIGNED_DELEGATE`,
+    `OP_FAST_TEST_SIGNATURE_LOG`, `OP_FAST_TEST_FORCE_GC`) sit behind
     `#[cfg(debug_assertions)]`, so release builds do not contain them.
 
 These touch upstream files (`delegate.rs`, `store/db.rs`, the command

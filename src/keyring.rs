@@ -1,33 +1,91 @@
 //! Thin wrapper over the OS keyring.
 //!
-//! Every value op-fast keeps (cached secrets and service-account tokens)
-//! goes through here, so tests can redirect storage without touching the
-//! operator's real Keychain:
+//! Two disjoint namespaces, each with its own typed entry points:
 //!
-//! - `OP_FAST_KEYRING_SERVICE` renames the base keyring service (default
-//!   `op-fast`). Service-account tokens live under `<base>-service-account`.
-//! - Debug builds only: `OP_FAST_TEST_KEYRING_DIR` swaps the OS keyring for a
-//!   plaintext directory. Release builds ignore it, so a shipped binary can
-//!   never be pointed at plaintext storage.
+//! - Cached secrets: service `op-fast`, account = a secret reference that
+//!   must start with `op://` (`cache_*`).
+//! - Service-account tokens: service `op-fast-service-account`, account = a
+//!   validated account name, which can never start with `op://`
+//!   (`token_*`).
+//!
+//! Both service names are compile-time constants in release builds. Debug
+//! builds (tests) may rename them with `OP_FAST_KEYRING_SERVICE` and may
+//! swap the OS keyring for a plaintext directory with
+//! `OP_FAST_TEST_KEYRING_DIR`; neither exists in a release binary.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
-const DEFAULT_SERVICE: &str = "op-fast";
+const CACHE_SERVICE: &str = "op-fast";
+const TOKEN_SERVICE: &str = "op-fast-service-account";
+const TOKEN_SUFFIX: &str = "-service-account";
 
 /// Keyring service holding cached secret values.
 pub fn cache_service() -> String {
-    std::env::var("OP_FAST_KEYRING_SERVICE")
+    #[cfg(debug_assertions)]
+    if let Some(base) = std::env::var("OP_FAST_KEYRING_SERVICE")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_SERVICE.to_string())
+    {
+        return base;
+    }
+    CACHE_SERVICE.to_string()
 }
 
 /// Keyring service holding service-account tokens.
-pub fn account_service() -> String {
-    format!("{}-service-account", cache_service())
+pub fn token_service() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(base) = std::env::var("OP_FAST_KEYRING_SERVICE")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return format!("{}{}", base, TOKEN_SUFFIX);
+    }
+    TOKEN_SERVICE.to_string()
 }
 
-pub fn get(service: &str, account: &str) -> Result<Option<String>> {
+fn checked_cache_service(reference: &str) -> Result<String> {
+    crate::template::validate_reference(reference)?;
+    let service = cache_service();
+    if service.ends_with(TOKEN_SUFFIX) {
+        bail!("refusing to use a token keyring service for cached secrets");
+    }
+    Ok(service)
+}
+
+fn checked_token_service(name: &str) -> Result<String> {
+    crate::config::validate_account_name(name)?;
+    Ok(token_service())
+}
+
+pub fn cache_get(reference: &str) -> Result<Option<String>> {
+    get(&checked_cache_service(reference)?, reference)
+}
+
+pub fn cache_set(reference: &str, value: &str) -> Result<()> {
+    set(&checked_cache_service(reference)?, reference, value)
+}
+
+pub fn cache_delete(reference: &str) -> Result<bool> {
+    delete(&checked_cache_service(reference)?, reference)
+}
+
+pub fn token_get(name: &str) -> Result<Option<String>> {
+    get(&checked_token_service(name)?, name)
+}
+
+pub fn token_set(name: &str, token: &str) -> Result<()> {
+    set(&checked_token_service(name)?, name, token)
+}
+
+pub fn token_delete(name: &str) -> Result<bool> {
+    delete(&checked_token_service(name)?, name)
+}
+
+pub fn token_exists(name: &str) -> Option<bool> {
+    exists(&checked_token_service(name).ok()?, name)
+}
+
+fn get(service: &str, account: &str) -> Result<Option<String>> {
     #[cfg(debug_assertions)]
     if let Some(dir) = test_dir() {
         return test_backend::get(&dir, service, account);
@@ -42,7 +100,7 @@ pub fn get(service: &str, account: &str) -> Result<Option<String>> {
     }
 }
 
-pub fn set(service: &str, account: &str, value: &str) -> Result<()> {
+fn set(service: &str, account: &str, value: &str) -> Result<()> {
     #[cfg(debug_assertions)]
     if let Some(dir) = test_dir() {
         return test_backend::set(&dir, service, account, value);
@@ -55,7 +113,7 @@ pub fn set(service: &str, account: &str, value: &str) -> Result<()> {
         .context("Failed to store value in keyring")
 }
 
-pub fn delete(service: &str, account: &str) -> Result<bool> {
+fn delete(service: &str, account: &str) -> Result<bool> {
     #[cfg(debug_assertions)]
     if let Some(dir) = test_dir() {
         return test_backend::delete(&dir, service, account);
@@ -72,7 +130,7 @@ pub fn delete(service: &str, account: &str) -> Result<bool> {
 
 /// Whether an entry exists, without reading its value (so no Keychain
 /// access dialog). `None` when the backend has no attribute-only lookup.
-pub fn exists(service: &str, account: &str) -> Option<bool> {
+fn exists(service: &str, account: &str) -> Option<bool> {
     #[cfg(debug_assertions)]
     if let Some(dir) = test_dir() {
         return Some(test_backend::exists(&dir, service, account));
@@ -172,5 +230,32 @@ mod test_backend {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_service_names_are_disjoint_constants() {
+        assert_eq!(CACHE_SERVICE, "op-fast");
+        assert_eq!(TOKEN_SERVICE, "op-fast-service-account");
+        assert_ne!(CACHE_SERVICE, TOKEN_SERVICE);
+    }
+
+    #[test]
+    fn cache_entry_points_refuse_non_references() {
+        // Rejected before any keyring access.
+        for bad in ["agents", "ops_FAKE", "op:/x", "op://V/i\n/f", ""] {
+            assert!(checked_cache_service(bad).is_err(), "{:?}", bad);
+        }
+        assert!(checked_cache_service("op://V/i/f").is_ok());
+    }
+
+    #[test]
+    fn token_entry_points_refuse_references() {
+        assert!(checked_token_service("op://V/i/f").is_err());
+        assert!(checked_token_service("agents").is_ok());
     }
 }

@@ -30,6 +30,14 @@ Makes op-fast safe to install as the machine-wide `op`.
   invoked as `op`, version/help go to the real `op`; deadline kills take the
   process group; `prompt_timeout` has a 1 s floor; passthrough survives a
   broken config; doctor checks token presence without reading tokens.
+- Round 2: keyring service names are constants in release builds and cache
+  keys must be `op://` references; strict passthrough token argv shape;
+  uncached signature check before every token-bearing spawn; control
+  characters in references rejected; config errors never quote values;
+  process group only when unattended; `--sa none` always desktop; op-fast
+  copies on PATH skip each other; unset variables in references are errors
+  and `${VAR:-default}` works; `run` masks multi-line secrets per line and
+  maps signals to `128 + signal`; `subst` dependency removed.
 - Fixes: `read`/`run` expand `$VAR` before caching; masked `run` output is
   byte-exact and fully drained; `run` leaves argv untouched; a reference no
   longer swallows a following `op://` or `NAME=` across whitespace.

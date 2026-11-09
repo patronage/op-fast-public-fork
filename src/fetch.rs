@@ -105,6 +105,11 @@ impl<'a> Fetcher<'a> {
     /// Resolve every reference to a value: cache first (unless `refresh`),
     /// then one delegate call per account group.
     pub fn resolve(&self, references: &[String], refresh: bool) -> Result<HashMap<String, String>> {
+        // Reject anything that is not a clean secret reference before any
+        // cache access, fetch, or audit write.
+        for reference in references {
+            crate::template::validate_reference(reference)?;
+        }
         let mut values: HashMap<String, String> = HashMap::new();
         let mut misses: Vec<&str> = Vec::new();
 
@@ -224,7 +229,7 @@ impl<'a> Fetcher<'a> {
         let mut report = WarmReport::default();
         let mut valid: Vec<&str> = Vec::new();
         for r in references {
-            if !r.starts_with("op://") {
+            if crate::template::validate_reference(r).is_err() {
                 report.skipped.push(r.clone());
             } else if !valid.contains(&r.as_str()) {
                 valid.push(r);

@@ -79,7 +79,10 @@ fn run(args: Vec<OsString>) -> anyhow::Result<()> {
     match Cli::try_parse_from(&args) {
         Ok(cli) => command::execute(cli.subcommand, cli.sa.as_deref()),
         Err(err) if is_passthrough(&args, &err) => {
-            let (rest, sa) = command::strip_own_flags(&args, true);
+            // `--refresh` is ours only on read/run/inject.
+            let accelerated = command::known_command(&args)
+                .is_some_and(|c| command::ACCELERATED_COMMANDS.contains(&c.as_str()));
+            let (rest, sa) = command::strip_own_flags(&args, accelerated);
             command::passthrough(&rest, sa.as_deref(), "unmodeled-flag")
         }
         Err(err) => err.exit(),

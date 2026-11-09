@@ -88,11 +88,16 @@ impl<'a> Selector<'a> {
         self.select(vault_of(reference))
     }
 
-    /// Account for a passthrough command: ambient token, then the account
-    /// covering `--vault` (if any), then the forced account, then desktop.
+    /// Account for a passthrough command: ambient token, then `--sa none`
+    /// (desktop), then the account covering `--vault` (if any), then a named
+    /// forced account, then desktop.
     pub fn for_vault(&self, vault: Option<&str>) -> Auth {
         if self.ambient {
             return Auth::Ambient;
+        }
+        // `--sa none` always means desktop auth.
+        if self.forced == Some(Forced::Desktop) {
+            return Auth::Desktop;
         }
         if let Some(account) = vault.and_then(|v| self.covering(v)) {
             return Auth::Account(account.name.clone());
@@ -171,21 +176,21 @@ pub fn token_for(auth: &Auth) -> Result<Option<String>> {
 }
 
 pub fn load_token(name: &str) -> Result<Option<String>> {
-    crate::keyring::get(&crate::keyring::account_service(), name)
+    crate::keyring::token_get(name)
 }
 
 /// Whether a token is stored, without reading it. `None` when the backend
 /// offers no attribute-only lookup (reported as "unknown").
 pub fn token_present(name: &str) -> Option<bool> {
-    crate::keyring::exists(&crate::keyring::account_service(), name)
+    crate::keyring::token_exists(name)
 }
 
 pub fn store_token(name: &str, token: &str) -> Result<()> {
-    crate::keyring::set(&crate::keyring::account_service(), name, token)
+    crate::keyring::token_set(name, token)
 }
 
 pub fn remove_token(name: &str) -> Result<bool> {
-    crate::keyring::delete(&crate::keyring::account_service(), name)
+    crate::keyring::token_delete(name)
 }
 
 #[cfg(test)]
@@ -245,10 +250,10 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_vault_flag_selects_before_forced_account() {
+    fn passthrough_vault_flag_selects_before_named_account_but_not_none() {
         let c = config();
         let none = selector(&c, Some(Forced::Desktop), false);
-        assert_eq!(none.for_vault(Some("CI")), Auth::Account("ci".into()));
+        assert_eq!(none.for_vault(Some("CI")), Auth::Desktop);
         assert_eq!(none.for_vault(Some("Private")), Auth::Desktop);
         let agents = selector(&c, Some(Forced::Account("agents".into())), false);
         assert_eq!(agents.for_vault(Some("CI")), Auth::Account("ci".into()));

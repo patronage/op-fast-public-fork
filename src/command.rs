@@ -89,7 +89,7 @@ pub fn execute(subcommand: Subcommand, sa: Option<&str>) -> Result<()> {
             // flags; strip them wherever they appear before `--`.
             let mut with_argv0 = vec![OsString::from("op-fast")];
             with_argv0.extend(args);
-            let (rest, inner_sa) = strip_own_flags(&with_argv0, true);
+            let (rest, inner_sa) = strip_own_flags(&with_argv0, false);
             passthrough(&rest, inner_sa.as_deref().or(sa), "delegated")
         }
     }
@@ -194,19 +194,29 @@ fn flag_value<'a>(args: &'a [OsString], name: &str) -> Option<&'a str> {
 
 /// Passthrough subcommands that may receive a service-account token: they
 /// only talk to 1Password and never execute a caller-supplied program.
-/// `args` excludes argv[0].
+/// `args` excludes argv[0] and op-fast's own flags.
+///
+/// Strict shape: the subcommand must be the very first argument and its
+/// sub-subcommand (for `item`, `vault`, `document`, `user`) the next one.
+/// Any flag before them, or a bare `run`/`plugin` anywhere before `--`,
+/// means no token: `op` may parse such an argv differently than we do.
 pub fn token_allowed(args: &[OsString]) -> bool {
-    let mut with_argv0 = vec![OsString::from("op")];
-    with_argv0.extend(args.iter().cloned());
-    let words = positionals(&with_argv0);
-    let first = words.first().map(String::as_str);
-    let second = words.get(1).map(String::as_str);
+    let words: Vec<&str> = args
+        .iter()
+        .map(|a| a.to_str().unwrap_or("\u{fffd}"))
+        .take_while(|a| *a != "--")
+        .collect();
+    if words.iter().any(|w| matches!(*w, "run" | "plugin")) {
+        return false;
+    }
+    let first = words.first().copied();
+    let second = words.get(1).copied();
     match (first, second) {
         (Some("read" | "inject" | "whoami"), _) => true,
         (Some("item"), Some("get" | "list" | "create" | "edit" | "delete" | "template")) => true,
         (Some("vault"), Some("get" | "list")) => true,
         (Some("document"), Some("get")) => true,
-        (Some("user"), Some("get")) => args.iter().take_while(|a| *a != "--").any(|a| a == "--me"),
+        (Some("user"), Some("get")) => words.contains(&"--me"),
         _ => false,
     }
 }
@@ -217,6 +227,14 @@ pub fn token_allowed(args: &[OsString]) -> bool {
 /// desktop auth. A token is only handed to allowlisted, non-executing
 /// subcommands, and only to a 1Password-signed `op`.
 pub fn passthrough(args: &[OsString], sa: Option<&str>, outcome: &'static str) -> Result<()> {
+    // A reference with a control character is refused before any audit
+    // write or delegate call.
+    for arg in args.iter().take_while(|a| *a != "--") {
+        let text = arg.to_string_lossy();
+        if text.contains("op://") && text.chars().any(char::is_control) {
+            anyhow::bail!("secret reference contains a control character; refusing it");
+        }
+    }
     let config = Config::load_or_default();
     let selector = Selector::new(&config, sa)?;
     let mut auth = selector.for_vault(flag_value(args, "vault"));
@@ -324,7 +342,13 @@ pub fn is_op_meta_invocation(args: &[OsString]) -> bool {
     }
     match args.get(1).and_then(|a| a.to_str()) {
         None => args.len() == 1,
-        Some(a) => matches!(a, "--version" | "-v" | "--help" | "-h" | "help"),
+        Some("--version" | "-v" | "--help" | "-h" | "help") => true,
+        // `op read --help` etc. show the real op's help.
+        Some("read" | "run" | "inject") => args[2..]
+            .iter()
+            .take_while(|a| *a != "--")
+            .any(|a| a == "--help" || a == "-h"),
+        Some(_) => false,
     }
 }
 
@@ -420,6 +444,20 @@ mod tests {
         assert!(!ok(&["user", "get", "someone"]));
         assert!(!ok(&["run", "--environment", "x", "--", "printenv"]));
         assert!(!ok(&["--account", "x", "run", "--", "sh"]));
+        // Flag ordering cannot smuggle a different subcommand past the check.
+        assert!(!ok(&[
+            "--no-masking",
+            "read",
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            "x"
+        ]));
+        assert!(!ok(&["--format", "json", "item", "list"]));
+        assert!(!ok(&["item", "--vault", "X", "get", "y"]));
+        assert!(!ok(&["read", "plugin"]));
+        assert!(ok(&["read", "op://a/b/c", "--", "run"]));
         for cmd in [
             "plugin",
             "signin",
@@ -446,6 +484,13 @@ mod tests {
         assert!(is_op_meta_invocation(&os(&["op", "help"])));
         assert!(is_op_meta_invocation(&os(&["op"])));
         assert!(!is_op_meta_invocation(&os(&["op", "read", "x"])));
+        assert!(is_op_meta_invocation(&os(&["op", "read", "--help"])));
+        assert!(is_op_meta_invocation(&os(&["op", "run", "-h"])));
+        assert!(is_op_meta_invocation(&os(&["op", "inject", "--help"])));
+        assert!(!is_op_meta_invocation(&os(&[
+            "op", "run", "--", "x", "--help"
+        ])));
+        assert!(!is_op_meta_invocation(&os(&["op-fast", "read", "--help"])));
         assert!(!is_op_meta_invocation(&os(&["op-fast", "--version"])));
         assert!(!is_op_meta_invocation(&os(&["op-fast"])));
     }

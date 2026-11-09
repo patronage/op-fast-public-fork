@@ -790,11 +790,11 @@ fn passthrough_selects_by_vault_flag() {
     assert_ok(&env.run(&["item", "list", "--vault", "Agents"]));
     assert_ok(&env.run(&["item", "list"]));
     assert_ok(&env.run(&["read", "--account", "x", "--vault", "CI", "op://CI/c/f"]));
-    // --vault selects before a forced account (N10).
     assert_ok(&env.run(&["--sa", "none", "item", "list", "--vault", "Agents"]));
     assert_ok(&env.run(&["--sa", "ci", "item", "list"]));
     let labels: Vec<String> = env.calls().into_iter().map(|c| c.0).collect();
-    assert_eq!(labels, ["agents", "unset", "ci", "agents", "ci"]);
+    // `--sa none` always forces desktop auth, even with --vault (S6).
+    assert_eq!(labels, ["agents", "unset", "ci", "unset", "ci"]);
 }
 
 #[test]
@@ -1504,7 +1504,8 @@ fn n6_sa_is_stripped_anywhere_and_bypass_keeps_local_commands() {
     let env = sa_env();
     assert_ok(&env.run(&["item", "list", "--sa", "ci", "--refresh"]));
     let calls = env.calls();
-    assert_eq!(args_of(&calls[0]), ["item", "list"]);
+    // Only `--sa` is ours on external subcommands; `--refresh` goes to op.
+    assert_eq!(args_of(&calls[0]), ["item", "list", "--refresh"]);
     assert_eq!(calls[0].0, "ci");
 
     let env = env.with("OP_FAST_BYPASS", "1");
@@ -1752,4 +1753,441 @@ fn force_note_absent_with_out_file_and_out_file_mode_is_600() {
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+// ------------------------------------------------------ review round 2
+
+#[test]
+fn b6_non_reference_cache_keys_are_rejected_everywhere() {
+    let env = sa_env();
+    for args in [
+        vec!["read", "agents"],
+        vec!["read", "--refresh", "agents"],
+        vec!["status", "agents"],
+        vec!["refresh", "agents"],
+        vec!["store", "clear", "agents"],
+    ] {
+        let out = env.run(&args);
+        assert!(!out.status.success(), "{:?}", args);
+        assert!(
+            stderr(&out).contains("must start with op://"),
+            "{:?}: {}",
+            args,
+            stderr(&out)
+        );
+        assert_no_token_leak(&env, &[&out]);
+    }
+    assert!(env.calls().is_empty());
+    // The stored token is untouched.
+    let rows: serde_json::Value =
+        serde_json::from_str(&stdout(&env.run(&["sa", "list", "--json"]))).unwrap();
+    assert_eq!(rows[0]["token"], true);
+}
+
+#[test]
+fn b6_cache_code_cannot_address_the_token_service() {
+    let env = sa_env().with(
+        "OP_FAST_KEYRING_SERVICE",
+        "op-fast-integration-test-service-account",
+    );
+    let out = env.run(&["read", "op://Private/p/f"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("token keyring service"),
+        "{}",
+        stderr(&out)
+    );
+    assert_no_token_leak(&env, &[&out]);
+    let out = env.run(&["doctor", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_ne!(
+        report["keyring_services"]["cache"],
+        report["keyring_services"]["tokens"]
+    );
+}
+
+#[test]
+fn b7_flag_ordering_cannot_smuggle_a_token() {
+    let env = sa_env();
+    // The reviewer's repro.
+    let out = env.run(&[
+        "--sa",
+        "agents",
+        "--no-masking",
+        "read",
+        "run",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printenv OP_SERVICE_ACCOUNT_TOKEN",
+    ]);
+    assert_no_token_leak(&env, &[&out]);
+    for args in [
+        vec!["--format", "json", "item", "list", "--vault", "Agents"],
+        vec!["item", "--vault", "Agents", "get", "y"],
+        vec!["--sa", "agents", "--format", "json", "item", "list"],
+    ] {
+        let out = env.run(&args);
+        assert_ok(&out);
+        assert_no_token_leak(&env, &[&out]);
+    }
+    for (label, _) in env.calls() {
+        assert_eq!(label, "unset");
+    }
+    // The strict shape still gets a token.
+    env.clear_calls();
+    assert_ok(&env.run(&["item", "list", "--vault", "Agents", "--format", "json"]));
+    assert_eq!(env.calls()[0].0, "agents");
+}
+
+#[test]
+fn s1_signature_is_verified_before_every_token_bearing_spawn() {
+    let env = sa_env();
+    let log = env.dir.join("sig.log");
+    let env = env.with("OP_FAST_TEST_SIGNATURE_LOG", log.to_str().unwrap());
+    let manifest = env.dir.join("refs");
+    // The missing ref sinks the batch, so warm falls back to per-ref reads:
+    // one inject + two reads = three token-bearing spawns, plus the check
+    // before the token is read.
+    fs::write(&manifest, "op://Agents/a/f\nop://Agents/gone/f\n").unwrap();
+    let out = env.run(&["warm", "--manifest", manifest.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    let spawns = env.calls().iter().filter(|(l, _)| l == "agents").count();
+    assert_eq!(spawns, 3);
+    let checks = fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(
+        checks,
+        spawns + 1,
+        "one check per token-bearing spawn, uncached"
+    );
+}
+
+#[test]
+fn s2_control_characters_in_references_are_rejected_before_anything() {
+    let spoof = "op://Private/x\n[ERROR] 2026/11/09 12:00:00 error initializing client: authorization timeout/f";
+    let env = expired_env().with("FAKE_OP_STDERR", APPROVAL_TIMEOUT);
+    let audit_before = env.audit_text();
+    for args in [
+        vec!["read", spoof],
+        vec!["status", spoof],
+        vec!["refresh", spoof],
+        vec!["store", "clear", spoof],
+        vec!["read", "--account", "x", spoof],
+        vec!["read", "op://Private/x\u{1b}[2J/f"],
+    ] {
+        let out = env.run(&args);
+        assert!(!out.status.success(), "{:?}", args);
+        assert!(
+            stderr(&out).contains("control character"),
+            "{}",
+            stderr(&out)
+        );
+    }
+    assert!(
+        env.calls()
+            .iter()
+            .all(|(_, a)| a.first().map(String::as_str) != Some("read")
+                || !a.iter().any(|x| x.contains('\n')))
+    );
+    assert_eq!(env.audit_text(), audit_before, "no audit write");
+}
+
+#[test]
+fn s3_ref_checks_the_signature_before_reading_the_token() {
+    let env = sa_env();
+    // Make the token unreadable: reading it would fail with a keyring
+    // error, so a signature refusal proves the check ran first.
+    for dir in fs::read_dir(env.dir.join("keyring")).unwrap().flatten() {
+        for f in fs::read_dir(dir.path()).unwrap().flatten() {
+            fs::set_permissions(f.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        }
+    }
+    let out = without_signature_escape(&env)
+        .args(["ref", "item", "--vault", "Agents"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("not signed by 1Password")
+            || stderr(&out).contains("only supported on macOS"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn s4_config_type_errors_never_quote_the_value() {
+    let env = Env::new();
+    env.config("[[service_account]]\nname = \"a\"\nvaults = \"ops_FAKETOKEN1\"\n");
+    for args in [
+        vec!["read", "op://Private/x/y"],
+        vec!["doctor"],
+        vec!["item", "list"],
+    ] {
+        let out = env.run(&args);
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(!text.contains("FAKETOKEN"), "{:?}: {}", args, text);
+    }
+    let out = env.run(&["read", "op://Private/x/y"]);
+    assert!(
+        stderr(&out).contains("service_account.vaults"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains("line 3"), "{}", stderr(&out));
+}
+
+#[test]
+fn s5_tty_fetch_stays_in_the_foreground_group() {
+    if !Path::new("/usr/bin/expect").exists() {
+        eprintln!("skipping: /usr/bin/expect not available");
+        return;
+    }
+    let env = Env::new();
+    let script = env.dir.join("tty.exp");
+    let mut vars = String::new();
+    for (k, v) in [
+        (
+            "OP_FAST_STORE_DIR",
+            env.dir.join("store").display().to_string(),
+        ),
+        (
+            "OP_FAST_CONFIG",
+            env.dir.join("config.toml").display().to_string(),
+        ),
+        (
+            "OP_FAST_TEST_KEYRING_DIR",
+            env.dir.join("keyring").display().to_string(),
+        ),
+        (
+            "OP_FAST_KEYRING_SERVICE",
+            "op-fast-integration-test".to_string(),
+        ),
+        ("OP_FAST_COMMAND", env.fake.display().to_string()),
+        ("FAKE_OP_TTY_READ", "1".to_string()),
+    ] {
+        vars.push_str(&format!("set env({}) {{{}}}\n", k, v));
+    }
+    fs::write(
+        &script,
+        format!(
+            r#"set timeout 8
+{vars}spawn "{bin}" read op://Private/tty/f
+expect {{
+  "enter value: " {{ send "typed-at-tty\r" }}
+  timeout {{ puts "RESULT=no-prompt"; exit 1 }}
+}}
+expect {{
+  -re {{typed-at-tty\r?\n.*typed-at-tty}} {{ puts "RESULT=ok"; exit 0 }}
+  timeout {{ puts "RESULT=hung"; exit 1 }}
+}}
+"#,
+            vars = vars,
+            bin = BIN
+        ),
+    )
+    .unwrap();
+    let start = Instant::now();
+    let out = Command::new("/usr/bin/expect")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let text = stdout(&out);
+    assert!(text.contains("RESULT=ok"), "{}", text);
+    assert!(start.elapsed() < Duration::from_secs(8));
+}
+
+#[test]
+fn s6_sa_none_forces_desktop_even_with_vault_and_named_sa_yields() {
+    let env = sa_env();
+    assert_ok(&env.run(&["--sa", "none", "item", "list", "--vault", "Agents"]));
+    assert_ok(&env.run(&["--sa", "ci", "item", "list", "--vault", "Agents"]));
+    let labels: Vec<String> = env.calls().into_iter().map(|c| c.0).collect();
+    assert_eq!(labels, ["unset", "agents"]);
+    let help = stdout(&env.run(&["agent-help"]));
+    assert!(
+        help.contains("`--sa none` always forces desktop"),
+        "{}",
+        help
+    );
+}
+
+#[test]
+fn s7_two_op_fast_files_on_path_reach_the_real_op_in_one_hop() {
+    let env = Env::new();
+    env.set_values(&[("op://Private/db/password", "real-fake-value")]);
+    let copy_dir = env.dir.join("copy");
+    let link_dir = env.dir.join("link");
+    let real_dir = env.dir.join("real");
+    for d in [&copy_dir, &link_dir, &real_dir] {
+        fs::create_dir_all(d).unwrap();
+    }
+    fs::copy(BIN, copy_dir.join("op")).unwrap();
+    std::os::unix::fs::symlink(BIN, link_dir.join("op")).unwrap();
+    write_exe(&real_dir.join("op"), FAKE_OP);
+    let path = format!(
+        "{}:{}:{}:/usr/bin:/bin",
+        copy_dir.display(),
+        link_dir.display(),
+        real_dir.display()
+    );
+    let out = env
+        .base(&copy_dir.join("op"))
+        .env("PATH", path)
+        .args(["read", "op://Private/db/password"])
+        .output()
+        .unwrap();
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "real-fake-value\n");
+    assert_eq!(env.calls().len(), 1);
+}
+
+#[test]
+fn s9_refresh_is_stripped_only_on_accelerated_commands() {
+    let env = Env::new();
+    env.set_values(&[("op://a/b/c", "v")]);
+    assert_ok(&env.run(&["read", "--refresh", "--account", "x", "op://a/b/c"]));
+    assert_ok(&env.run(&["vault", "list", "--refresh", "--sa", "none"]));
+    let calls = env.calls();
+    assert_eq!(args_of(&calls[0]), ["read", "--account", "x", "op://a/b/c"]);
+    assert_eq!(args_of(&calls[1]), ["vault", "list", "--refresh"]);
+}
+
+#[test]
+fn s10_unset_variable_in_a_reference_is_an_error() {
+    let env = Env::new().with("X", "op://$NOPE_VAR/i/f");
+    env.set_values(&[("op://Private/db/password", "v")]);
+    let out = env.run(&["read", "op://$NOPE_VAR/db/password"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("NOPE_VAR"), "{}", stderr(&out));
+    let out = env.run(&["run", "--", "true"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("NOPE_VAR"));
+    let out = env.run_stdin(&["inject"], "x={{ op://$NOPE_VAR/db/password }}\n");
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("NOPE_VAR"));
+    assert!(
+        env.calls().is_empty(),
+        "never fetch a partly expanded reference"
+    );
+    assert!(!env.audit_text().contains("op://"), "never audit it either");
+
+    // ${VAR:-default} is supported, as documented.
+    let out = env.run(&["read", "op://${NOPE_VAR:-Private}/db/password"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "v\n");
+}
+
+#[test]
+fn s10_env_file_values_expand_and_inherited_values_do_not() {
+    let env = Env::new()
+        .with("WHO", "world")
+        .with("RAW", "a$WHO ${WHO:-x} \\n");
+    let file = env.dir.join(".env");
+    fs::write(&file, "GREETING=hello-$WHO\nPLAIN=${MISSING:-fallback}\n").unwrap();
+    let out = env.run(&[
+        "run",
+        "--no-masking",
+        "--env-file",
+        file.to_str().unwrap(),
+        "--",
+        "sh",
+        "-c",
+        "printenv GREETING; printenv PLAIN; printenv RAW",
+    ]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "hello-world\nfallback\na$WHO ${WHO:-x} \\n\n");
+}
+
+#[test]
+fn s11_invoked_as_op_subcommand_help_goes_to_real_op() {
+    let env = Env::new();
+    let shim_dir = env.dir.join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("op");
+    std::os::unix::fs::symlink(BIN, &shim).unwrap();
+    for sub in ["read", "run", "inject"] {
+        let out = env
+            .base(&shim)
+            .env("OP_FAST_COMMAND", &env.fake)
+            .args([sub, "--help"])
+            .output()
+            .unwrap();
+        assert_ok(&out);
+        assert_eq!(stdout(&out), format!("fake-op: {} --help\n", sub));
+    }
+    // op-fast's own name keeps op-fast's help.
+    let out = env.run(&["read", "--help"]);
+    assert!(stdout(&out).contains("--refresh"));
+}
+
+#[test]
+fn s12_multi_line_secrets_are_masked_per_line_and_signals_map_to_128_plus() {
+    // Per-line masking of multi-line values is pinned by
+    // run::tests::multi_line_secrets_mask_every_line_and_longest_first (the
+    // fake `op` stores one line per value).
+    let env = Env::new().with("KEY", "op://Private/key/pem");
+    env.set_values(&[("op://Private/key/pem", "line-one-secret")]);
+    let out = env.run(&["run", "--", "sh", "-c", "echo before line-one-secret after"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "before <concealed by 1Password> after\n");
+
+    let out = env.run(&["run", "--", "sh", "-c", "kill -TERM $$"]);
+    assert_eq!(out.status.code(), Some(128 + 15));
+    let out = env.run(&["run", "--no-masking", "--", "sh", "-c", "kill -TERM $$"]);
+    assert_eq!(out.status.code(), Some(128 + 15));
+}
+
+#[test]
+fn s13_inject_reference_never_spans_a_newline() {
+    let env = Env::new();
+    env.set_values(&[("op://V/i/f", "pw-fake")]);
+    let out = env.run_stdin(&["inject"], "password: op://V/i/f\nuser: bob\n");
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "password: pw-fake\nuser: bob\n");
+    let rows: serde_json::Value =
+        serde_json::from_str(&stdout(&env.run(&["store", "list", "--json"]))).unwrap();
+    let keys: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["reference"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["op://V/i/f"]);
+}
+
+#[test]
+fn s14_non_executable_op_on_path_is_skipped() {
+    let env = Env::new();
+    env.set_values(&[("op://Private/db/password", "real-fake-value")]);
+    let noexec = env.dir.join("noexec");
+    let real = env.dir.join("real");
+    fs::create_dir_all(&noexec).unwrap();
+    fs::create_dir_all(&real).unwrap();
+    fs::write(noexec.join("op"), "#!/bin/sh\necho evil\n").unwrap();
+    fs::set_permissions(noexec.join("op"), fs::Permissions::from_mode(0o644)).unwrap();
+    write_exe(&real.join("op"), FAKE_OP);
+    let out = env
+        .base(Path::new(BIN))
+        .env(
+            "PATH",
+            format!("{}:{}:/usr/bin:/bin", noexec.display(), real.display()),
+        )
+        .args(["read", "op://Private/db/password"])
+        .output()
+        .unwrap();
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "real-fake-value\n");
+}
+
+#[test]
+fn s14_inherited_env_without_references_is_byte_identical() {
+    let odd = "x$HOME ${HOME:-y} op:/not-a-ref \\t \u{e9}";
+    let env = Env::new()
+        .with("ODD", odd)
+        .with("SECRET", "op://Private/db/password");
+    env.set_values(&[("op://Private/db/password", "v")]);
+    let out = env.run(&["run", "--no-masking", "--", "printenv", "ODD"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), format!("{}\n", odd));
 }

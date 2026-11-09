@@ -12,6 +12,7 @@
 #   FAKE_OP_FAIL_DESKTOP_ONLY  only fail when no token is set
 #   FAKE_OP_SLEEP   sleep this many seconds before answering
 #   FAKE_OP_ITEM_JSON  file printed for `item get`
+#   FAKE_OP_TTY_READ  for `read`, read the value from /dev/tty instead
 #   FAKE_OP_GRANDCHILD  background a `sleep` and write its PID to this file
 #                       before sleeping (process-group kill test)
 #
@@ -46,6 +47,13 @@ if [ "${1:-}" = "--version" ]; then
   exit 0
 fi
 
+for a in "$@"; do
+  if [ "$a" = "--help" ] || [ "$a" = "-h" ]; then
+    echo "fake-op: $*"
+    exit 0
+  fi
+done
+
 if [ -n "${FAKE_OP_GRANDCHILD:-}" ]; then
   sleep 30 &
   echo $! > "$FAKE_OP_GRANDCHILD"
@@ -76,6 +84,12 @@ not_found() {
 
 case "${1:-}" in
   read)
+    if [ -n "${FAKE_OP_TTY_READ:-}" ]; then
+      printf 'enter value: ' > /dev/tty
+      IFS= read -r v < /dev/tty
+      printf '%s\n' "$v"
+      exit 0
+    fi
     ref=""
     for a in "$@"; do
       case "$a" in op://*) ref="$a" ;; esac

@@ -30,6 +30,7 @@ struct Report {
     config: ConfigReport,
     store: StoreReport,
     keyring: &'static str,
+    keyring_services: KeyringServices,
     service_accounts: Vec<AccountReport>,
     ambient_service_account_token: bool,
     forced_account: Option<String>,
@@ -39,6 +40,12 @@ struct Report {
     stale_grace: String,
     stderr_is_tty: bool,
     bypass: bool,
+}
+
+#[derive(Serialize)]
+struct KeyringServices {
+    cache: String,
+    tokens: String,
 }
 
 #[derive(Serialize)]
@@ -147,6 +154,10 @@ pub fn execute(args: DoctorArgs, sa: Option<&str>) -> Result<()> {
         },
         store,
         keyring: crate::keyring::backend_name(),
+        keyring_services: KeyringServices {
+            cache: crate::keyring::cache_service(),
+            tokens: crate::keyring::token_service(),
+        },
         service_accounts: config
             .service_accounts
             .iter()
@@ -205,7 +216,10 @@ pub fn execute(args: DoctorArgs, sa: Option<&str>) -> Result<()> {
             .map(|e| format!(" ERROR {}", e))
             .unwrap_or_default()
     );
-    println!("keyring:    {}", r.keyring);
+    println!(
+        "keyring:    {} (cache service {}, token service {})",
+        r.keyring, r.keyring_services.cache, r.keyring_services.tokens
+    );
     if r.service_accounts.is_empty() {
         println!("accounts:   none configured (desktop auth for everything)");
     }

@@ -44,9 +44,13 @@ pub fn execute(args: RefArgs, sa: Option<&str>) -> Result<()> {
     let config = Config::load()?;
     let selector = Selector::new(&config, sa)?;
     let auth = selector.for_vault(args.vault.as_deref());
+    let delegate = OpDelegate::new(&config)?;
+    if matches!(auth, crate::account::Auth::Account(_)) {
+        // Check the delegate before the token is even read.
+        delegate.verify_for_token()?;
+    }
     let token = crate::account::token_for(&auth)?;
     let call = CallAuth::new(auth.clone(), token, &config);
-    let delegate = OpDelegate::new(&config)?;
 
     let item = match delegate.item_get_json(&args.item, args.vault.as_deref(), &call) {
         Ok(item) => item,
@@ -96,9 +100,20 @@ pub fn vault_segment(item: &Value, config: &Config, ids: bool) -> Result<String>
     let name = item.pointer("/vault/name").and_then(Value::as_str);
     let listed_by_id = config.service_accounts.iter().any(|a| a.covers_vault(id));
     Ok(match name {
-        Some(name) if !ids && !listed_by_id && !name.contains('/') => name.to_string(),
+        Some(name) if !ids && !listed_by_id && name_fits_reference(name) => name.to_string(),
         _ => id.to_string(),
     })
+}
+
+/// Whether a vault name can sit in a reference as written: the reference
+/// grammar's characters only (no `/`, `$`, `?`, control characters, ...),
+/// and no leading or trailing space.
+fn name_fits_reference(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
 }
 
 /// Build reference lines from `op item get --format json` output. Reads
@@ -201,6 +216,27 @@ mod tests {
         let mut c = Config::load_from_str("").unwrap();
         assert_eq!(vault_segment(&item(), &c, false).unwrap(), "Agents");
         assert_eq!(vault_segment(&item(), &c, true).unwrap(), "vlt456");
+        for odd in [
+            "Team/Prod",
+            "Cost $5",
+            "Q?x",
+            "Tab\there",
+            " lead",
+            "trail ",
+            "Ünï",
+        ] {
+            let mut it = item();
+            it["vault"]["name"] = serde_json::Value::String(odd.into());
+            assert_eq!(
+                vault_segment(&it, &c, false).unwrap(),
+                "vlt456",
+                "{:?}",
+                odd
+            );
+        }
+        let mut spaced = item();
+        spaced["vault"]["name"] = serde_json::Value::String("Team Prod".into());
+        assert_eq!(vault_segment(&spaced, &c, false).unwrap(), "Team Prod");
         c.service_accounts.push(crate::config::ServiceAccount {
             name: "agents".into(),
             vaults: vec!["vlt456".into()],

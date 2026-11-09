@@ -124,13 +124,34 @@ DB_PASSWORD='op://app-prod/db/password' op-fast run --no-masking -- printenv DB_
 op-fast run --refresh --env-file .env -- ./deploy.sh
 ```
 
-`run` expands `$VAR` in each environment value that contains a reference,
-then resolves the references; the cache key is the expanded reference. The
-command's arguments are passed through untouched: op-fast never expands
+Variables use `$VAR`, `${VAR}`, or `${VAR:-default}` (`${VAR:default}`
+also works). Inside a secret reference an unset variable with no default is
+an error naming the variable, for `read`, `run`, and `inject`; op-fast never
+fetches, caches, or audits a partly expanded reference.
+
+`run` treats the two sources of environment differently:
+
+- `--env-file` values are variable-expanded, reference or not, and win over
+  the inherited environment.
+- Inherited values are passed through byte for byte unless they contain a
+  reference; then only the variables inside the reference are expanded.
+
+Treat an `--env-file` like code: a hostile env file can build a reference
+from your environment values (for example `X=op://$SOME_VAR/item/field`).
+That reference, with the expanded value in it, is then sent to `op` and
+written to the local audit log.
+
+The command's arguments are passed through untouched: op-fast never expands
 variables or substitutes references inside argv, so secrets reach the child
 only through its environment (as with `op run`). Masked output is copied as
 raw bytes, so non-UTF-8 output survives, and op-fast drains it completely
-before exiting.
+before exiting. Masking covers each secret and every line of 4 or more
+characters of a multi-line secret, longest first. A child killed by a
+signal makes op-fast exit with `128 + signal`.
+
+A secret reference never spans a newline or tab, keeps query strings such
+as `?attribute=otp`, and is rejected in every command if it contains a
+control character.
 
 `inject` also accepts `--refresh`.
 
@@ -198,29 +219,43 @@ op-fast sa remove agents
 
 - A reference uses the first account whose `vaults` contains its vault
   segment (name or ID; names match case-insensitively). `--sa <name>` or
-  `OP_FAST_ACCOUNT=<name>` forces an account; `--sa none` forces desktop
-  auth. An unknown name is an error, never a silent downgrade.
+  `OP_FAST_ACCOUNT=<name>` forces an account; `--sa none` always forces
+  desktop auth. An unknown name is an error, never a silent downgrade.
 - `op-fast ref` prints the vault *name* in the reference so a name-based
-  `vaults` entry keeps matching. It prints the vault ID with `--ids`, or
-  when an account lists that vault by ID.
-- Passthrough commands use the account covering `--vault <v>`, else the
-  forced account, else desktop auth.
+  `vaults` entry keeps matching. It prints the vault ID with `--ids`, when
+  an account lists that vault by ID, or when the name has characters a
+  reference cannot carry (`/`, `$`, `?`, control characters, non-ASCII, or
+  leading/trailing spaces).
+- Passthrough commands: `--sa none` means desktop auth; otherwise the
+  account covering `--vault <v>`, else a named `--sa`/`OP_FAST_ACCOUNT`,
+  else desktop auth. Only `--sa` is stripped from passthrough argv;
+  `--refresh` is stripped only from `read`, `run`, and `inject`.
 - op-fast sets `OP_SERVICE_ACCOUNT_TOKEN` on that one `op` child only, and
   only after the delegate passes a code-signature check (macOS:
   `codesign --verify` with requirement
   `anchor apple generic and certificate leaf[subject.OU] = "2BUA8C4S2C"`,
-  i.e. signed by AgileBits/1Password). An unsigned or differently signed
-  delegate is refused by path. On other platforms service-account tokens
-  are refused for now.
+  i.e. signed by AgileBits/1Password). The check runs, uncached,
+  immediately before every token-bearing spawn. An unsigned or differently
+  signed delegate is refused by path. On other platforms service-account
+  tokens are refused for now. Limit: a process running as your user that
+  can write the `op` binary (a Homebrew Caskroom `op` is user-writable) can
+  still swap it in the moment between the check and the exec.
 - Passthrough hands a token only to subcommands that never execute a
   caller-supplied program: `read`, `inject`, `item get|list|create|edit|delete|template`,
-  `vault get|list`, `document get`, `whoami`, `user get --me`. Any other
-  passthrough runs with desktop auth (with a note on stderr), and a
-  passthrough `op run` under a selected account is refused. The process
+  `vault get|list`, `document get`, `whoami`, `user get --me`. The
+  subcommand must be the first argument (after op-fast's own flags) and its
+  sub-subcommand the next one; any flag before them, or a bare `run` or
+  `plugin` anywhere before `--`, means no token. Any other passthrough runs
+  with desktop auth (with a note on stderr), and a passthrough `op run`
+  under a selected account is refused. The process
   started by `op-fast run` never sees the token.
 - If your environment already has `OP_SERVICE_ACCOUNT_TOKEN`, op-fast leaves
   it alone and selects no account.
 - `run`, `inject`, and `warm` make one delegate call per account group.
+- Cached values and tokens live in two fixed keyring services, `op-fast`
+  (accounts must be `op://` references) and `op-fast-service-account`
+  (accounts must be valid names). Both names are compile-time constants in
+  release builds, and no cache code path can address the token service.
 - Tokens live only in the OS keyring (service `op-fast-service-account`):
   never in the config file, on argv, in the audit log, or in error text. A
   `token` key in the config file is rejected, and the error names only the
@@ -280,12 +315,15 @@ which still run locally.
 
 op-fast can be the machine-wide `op`. When it looks for the real `op` on
 `PATH`, it considers only absolute `PATH` entries (empty entries and `.` are
-ignored, so a repository-local `./op` can never become the delegate), and it
-skips any candidate that resolves to its own executable. A symlink or copy
-named `op` earlier on `PATH` therefore works with no configuration. When
-invoked as `op`, `--version`, `-v`, `--help`, `-h`, `help`, and a bare `op`
-go to the real `op`, so callers see its version and help;
-`op-fast --version` still reports op-fast:
+ignored, so a repository-local `./op` can never become the delegate), skips
+non-executable files, and skips any candidate that resolves to its own
+executable or to an op-fast already on this delegate chain (passed along in
+`OP_FAST_VISITED`). A symlink or copy named `op` earlier on `PATH` therefore
+works with no configuration, and two op-fast files on `PATH` cost one extra
+hop, not a loop. When invoked as `op`, `--version`, `-v`, `--help`, `-h`,
+`help`, a bare `op`, and `read`/`run`/`inject` with `--help` or `-h` go to
+the real `op`, so callers see its version and help; `op-fast --version`
+still reports op-fast:
 
 ```bash
 ln -s "$(command -v op-fast)" ~/.local/bin/op   # ~/.local/bin before the real op on PATH
@@ -344,15 +382,16 @@ ttl = "15m"
 | `OP_FAST_ACCOUNT` | Force a service account (`none` = desktop auth); `--sa` wins |
 | `OP_FAST_NO_STALE` | Truthy (`1`, `true`, anything but empty/`0`/`false`) disables stale-on-auth-failure |
 | `OP_FAST_BYPASS` | Truthy: send everything but op-fast-only commands straight to the real `op` |
-| `OP_FAST_KEYRING_SERVICE` | Rename the keyring service (default `op-fast`; tokens use `<name>-service-account`) |
 
 ### Fail fast and stale on auth failure
 
 Any `op` call that may need a desktop approval gets a deadline: 60 s when
 stderr is a TTY, otherwise `prompt_timeout`. Service-account calls get a
-30 s network deadline. At the deadline op-fast kills the child's whole
-process group (the child runs in its own group), so helpers it spawned die
-too.
+30 s network deadline. When stderr is not a TTY, the child runs in its
+own process group and the deadline kills the whole group, so helpers it
+spawned die too. On a TTY the child stays in the foreground group (so an
+interactive `op` prompt can read the terminal) and the deadline kills the
+child itself.
 
 Expired entries stay in the store for `stale_grace`, so a cached value is
 retained for its TTL **plus** `stale_grace` (default 30 days) before GC

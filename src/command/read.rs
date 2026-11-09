@@ -84,7 +84,8 @@ pub struct ReadArgs {
 pub fn execute(args: ReadArgs, sa: Option<&str>) -> Result<()> {
     // Expand `$VAR` first so the cache key, account selection, and audit
     // all use the reference that is actually fetched.
-    let reference = crate::template::resolve_variables(&args.reference);
+    let reference = crate::template::expand_reference(&args.reference)?;
+    crate::template::validate_reference(&reference)?;
 
     let config = Config::load()?;
     let fetcher = Fetcher::new(&config, sa, "read")?;

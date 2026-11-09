@@ -97,12 +97,14 @@ impl Db {
     }
 
     pub fn meta(&self, reference: &str) -> Result<Option<Meta>> {
+        crate::template::validate_reference(reference)?;
         let rtxn = self.env.read_txn()?;
         Ok(self.db.get(&rtxn, reference)?)
     }
 
     /// Entry regardless of expiry (used for stale-on-auth-failure).
     pub fn get_any(&self, reference: &str) -> Result<Option<(String, Meta)>> {
+        crate::template::validate_reference(reference)?;
         let meta = {
             let rtxn = self.env.read_txn()?;
             let Some(meta) = self.db.get(&rtxn, reference)? else {
@@ -124,6 +126,7 @@ impl Db {
     }
 
     pub fn put(&self, reference: &str, value: &str, ttl: Duration) -> Result<()> {
+        crate::template::validate_reference(reference)?;
         let meta = Meta::new(ttl);
 
         Self::keyring_put(reference, value)?;
@@ -139,6 +142,7 @@ impl Db {
     }
 
     pub fn delete(&self, reference: &str) -> Result<bool> {
+        crate::template::validate_reference(reference)?;
         let deleted_keyring = Self::keyring_delete(reference)?;
 
         let mut wtxn = self.env.write_txn()?;
@@ -162,7 +166,9 @@ impl Db {
         let rtxn = self.env.read_txn()?;
         let iter = self.db.iter(&rtxn)?;
         for (reference, _) in iter.flatten() {
-            let _ = Self::keyring_delete(reference);
+            if crate::template::validate_reference(reference).is_ok() {
+                let _ = Self::keyring_delete(reference);
+            }
         }
         drop(rtxn);
 
@@ -181,7 +187,14 @@ impl Db {
         let mut deleted = 0;
 
         for (reference, meta) in &entries {
-            if meta.is_expired() && !meta.is_in_grace(grace) {
+            if crate::template::validate_reference(reference).is_err() {
+                // A key that is not a secret reference never touches the
+                // keyring; drop its metadata only.
+                let mut wtxn = self.env.write_txn()?;
+                self.db.delete(&mut wtxn, reference)?;
+                wtxn.commit()?;
+                deleted += 1;
+            } else if meta.is_expired() && !meta.is_in_grace(grace) {
                 self.delete(reference)?;
                 deleted += 1;
             }
@@ -208,14 +221,14 @@ impl Db {
     }
 
     fn keyring_get(reference: &str) -> Result<Option<String>> {
-        crate::keyring::get(&crate::keyring::cache_service(), reference)
+        crate::keyring::cache_get(reference)
     }
 
     fn keyring_put(reference: &str, value: &str) -> Result<()> {
-        crate::keyring::set(&crate::keyring::cache_service(), reference, value)
+        crate::keyring::cache_set(reference, value)
     }
 
     fn keyring_delete(reference: &str) -> Result<bool> {
-        crate::keyring::delete(&crate::keyring::cache_service(), reference)
+        crate::keyring::cache_delete(reference)
     }
 }

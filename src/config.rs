@@ -78,23 +78,61 @@ pub fn display_account_name(name: &str) -> String {
 /// line must not reach the terminal): message plus line number only.
 fn parse_toml(content: &str) -> Result<RawConfig> {
     toml::from_str(content).map_err(|e| {
-        let line = e.span().map(|span| {
-            content[..span.start.min(content.len())]
-                .matches('\n')
-                .count()
-                + 1
-        });
-        let message = e
-            .message()
-            .lines()
-            .next()
-            .unwrap_or("parse error")
-            .to_string();
-        match line {
-            Some(line) => anyhow::anyhow!("{} (line {})", message, line),
-            None => anyhow::anyhow!("{}", message),
+        let Some(span) = e.span() else {
+            return anyhow::anyhow!("invalid config");
+        };
+        let offset = span.start.min(content.len());
+        let line_no = content[..offset].matches('\n').count() + 1;
+        let lines: Vec<&str> = content.lines().collect();
+        // Nearest line at or above the error that assigns a key, and the
+        // table header it sits under.
+        let mut key = None;
+        let mut table = None;
+        for idx in (0..line_no.min(lines.len())).rev() {
+            let l = lines[idx].trim();
+            if l.starts_with('[') {
+                table = Some(safe_key(l.trim_matches(|c| c == '[' || c == ']')));
+                break;
+            }
+            if key.is_none()
+                && let Some((k, _)) = l.split_once('=')
+            {
+                key = Some(safe_key(k.trim().trim_matches('"')));
+            }
+        }
+        let path = match (table, key) {
+            (Some(t), Some(k)) => format!("{}.{}", t, k),
+            (None, Some(k)) => k,
+            (Some(t), None) => t,
+            (None, None) => String::new(),
+        };
+        if path.is_empty() {
+            anyhow::anyhow!("invalid config (line {})", line_no)
+        } else {
+            anyhow::anyhow!("invalid config at `{}` (line {})", path, line_no)
         }
     })
+}
+
+/// A config key safe to print: shown only when it looks like a key, never
+/// like a pasted token.
+fn safe_key(key: &str) -> String {
+    let looks_like_key = !key.is_empty()
+        && key.len() <= 64
+        && !key.contains("ops_")
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-.:/*?{}, ".contains(c));
+    if looks_like_key {
+        key.to_string()
+    } else {
+        "<key>".to_string()
+    }
+}
+
+/// Parse a duration without echoing the value in the error.
+fn duration(value: &str, what: &str) -> Result<Duration> {
+    humantime::parse_duration(value).map_err(|_| anyhow::anyhow!("invalid duration for `{}`", what))
 }
 
 /// Floor for `prompt_timeout`: a zero deadline would fail every fetch.
@@ -134,14 +172,11 @@ impl Config {
         config.path = config_path;
 
         if let Ok(env_ttl) = env::var("OP_FAST_DEFAULT_TTL") {
-            config.default_ttl =
-                humantime::parse_duration(&env_ttl).context("Invalid OP_FAST_DEFAULT_TTL")?;
+            config.default_ttl = duration(&env_ttl, "OP_FAST_DEFAULT_TTL")?;
         }
 
         if let Ok(v) = env::var("OP_FAST_PROMPT_TIMEOUT") {
-            config.prompt_timeout = humantime::parse_duration(&v)
-                .context("Invalid OP_FAST_PROMPT_TIMEOUT")?
-                .max(MIN_PROMPT_TIMEOUT);
+            config.prompt_timeout = duration(&v, "OP_FAST_PROMPT_TIMEOUT")?.max(MIN_PROMPT_TIMEOUT);
         }
 
         Ok(config)
@@ -193,26 +228,22 @@ impl Config {
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self> {
-        let default_ttl = raw
-            .default_ttl
-            .map(|s| humantime::parse_duration(&s))
-            .transpose()
-            .context("Invalid default_ttl")?
-            .unwrap_or(DEFAULT_TTL);
+        let parse = |v: Option<String>, what: &str, default: Duration| -> Result<Duration> {
+            v.map(|s| duration(&s, what))
+                .transpose()
+                .map(|d| d.unwrap_or(default))
+        };
+        let default_ttl = parse(raw.default_ttl, "default_ttl", DEFAULT_TTL)?;
 
         let mut ttl_rules = Vec::new();
         for (pattern, ttl_str) in &raw.ttl {
-            let ttl = humantime::parse_duration(ttl_str)
-                .with_context(|| format!("Invalid TTL for pattern: {}", pattern))?;
-            ttl_rules.push(TtlRule::new(pattern, ttl)?);
+            let what = format!("ttl.{}", safe_key(pattern));
+            let ttl = duration(ttl_str, &what)?;
+            let rule = TtlRule::new(pattern, ttl)
+                .map_err(|_| anyhow::anyhow!("invalid glob pattern at `{}`", what))?;
+            ttl_rules.push(rule);
         }
 
-        let parse = |v: Option<String>, what: &str, default: Duration| -> Result<Duration> {
-            v.map(|s| humantime::parse_duration(&s))
-                .transpose()
-                .with_context(|| format!("Invalid {}", what))
-                .map(|d| d.unwrap_or(default))
-        };
         let prompt_timeout = parse(raw.prompt_timeout, "prompt_timeout", DEFAULT_PROMPT_TIMEOUT)?
             .max(MIN_PROMPT_TIMEOUT);
         let stale_grace = parse(raw.stale_grace, "stale_grace", DEFAULT_STALE_GRACE)?;
@@ -227,9 +258,8 @@ impl Config {
             );
             let ttl = sa
                 .ttl
-                .map(|s| humantime::parse_duration(&s))
-                .transpose()
-                .with_context(|| format!("Invalid ttl for service account {:?}", sa.name))?;
+                .map(|s| duration(&s, &format!("service_account.{}.ttl", sa.name)))
+                .transpose()?;
             service_accounts.push(ServiceAccount {
                 name: sa.name,
                 vaults: sa.vaults,
@@ -358,6 +388,41 @@ vaults = ["CI"]
         // A syntax error on that line must not echo it either.
         let err = parse("token = \"FAKE-SECRET-VALUE\n").unwrap_err();
         assert!(!format!("{:#}", err).contains("FAKE-SECRET-VALUE"));
+    }
+
+    #[test]
+    fn no_config_error_shape_quotes_a_value() {
+        let secret = "ops_FAKETOKEN1";
+        for src in [
+            format!(
+                "[[service_account]]\nname = \"a\"\nvaults = \"{}\"\n",
+                secret
+            ),
+            format!(
+                "[[service_account]]\nname = \"a\"\nvaults = [\n  1,\n  \"{}\" ]\n",
+                secret
+            ),
+            format!("default_ttl = \"{}\"\n", secret),
+            format!("prompt_timeout = \"{}\"\n", secret),
+            format!("[ttl]\n\"op://x/*\" = \"{}\"\n", secret),
+            format!("[[service_account]]\nname = \"a\"\nttl = \"{}\"\n", secret),
+            format!("op_command = {}\n", secret),
+            format!("[[service_account]]\nname = \"a\"\n{} = 1\n", secret),
+            format!("default_ttl = [\"{}\"]\n", secret),
+        ] {
+            let err = format!("{:#}", parse(&src).unwrap_err());
+            assert!(!err.contains("FAKETOKEN"), "{:?} -> {}", src, err);
+        }
+        let err = format!(
+            "{:#}",
+            parse(&format!(
+                "[[service_account]]\nname = \"a\"\nvaults = \"{}\"\n",
+                secret
+            ))
+            .unwrap_err()
+        );
+        assert!(err.contains("service_account.vaults"), "{}", err);
+        assert!(err.contains("line 3"), "{}", err);
     }
 
     #[test]
