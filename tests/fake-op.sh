@@ -72,9 +72,11 @@ if [ -n "${FAKE_OP_STDERR:-}" ]; then
   fi
 fi
 
+# Values may contain `\n` escapes for multi-line secrets.
 lookup() {
   [ -n "${FAKE_OP_VALUES:-}" ] && [ -f "$FAKE_OP_VALUES" ] || return 1
-  awk -F '\t' -v r="$1" '$1 == r { print $2; found = 1; exit } END { exit !found }' "$FAKE_OP_VALUES"
+  raw=$(awk -F '\t' -v r="$1" '$1 == r { print $2; found = 1; exit } END { exit !found }' "$FAKE_OP_VALUES") || return 1
+  printf '%b' "$raw"
 }
 
 not_found() {

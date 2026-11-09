@@ -89,19 +89,26 @@ pub fn execute(cmd: StoreCommand) -> Result<()> {
                     "expired"
                 };
                 let stored_at = chrono_conversion(meta.stored_at);
-                println!("{:<60} {:<20} {}", reference, stored_at, status);
+                // Escape control characters from legacy keys.
+                let shown = reference.escape_debug().to_string();
+                println!("{:<60} {:<20} {}", shown, stored_at, status);
             }
         }
         StoreSubcommand::Clear { reference } => match reference {
             Some(ref_str) => {
-                crate::template::validate_reference(&ref_str)?;
+                // Deletion accepts any `op://` key, including legacy keys
+                // with control characters.
+                anyhow::ensure!(
+                    ref_str.starts_with("op://"),
+                    "not a secret reference (must start with op://)"
+                );
                 let deleted = store.delete(&ref_str)?;
                 let outcome = if deleted { "cleared" } else { "not-found" };
                 crate::audit::record("store", Some(&ref_str), outcome, None, None);
                 if deleted {
-                    println!("Deleted: {}", ref_str);
+                    println!("Deleted: {}", ref_str.escape_debug());
                 } else {
-                    println!("Not found: {}", ref_str);
+                    println!("Not found: {}", ref_str.escape_debug());
                 }
             }
             None => {

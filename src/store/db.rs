@@ -141,8 +141,13 @@ impl Db {
         Ok(())
     }
 
+    /// Delete an entry. Accepts any `op://` key, including legacy keys with
+    /// control characters that reads and writes refuse.
     pub fn delete(&self, reference: &str) -> Result<bool> {
-        crate::template::validate_reference(reference)?;
+        anyhow::ensure!(
+            reference.starts_with("op://"),
+            "not a secret reference (must start with op://)"
+        );
         let deleted_keyring = Self::keyring_delete(reference)?;
 
         let mut wtxn = self.env.write_txn()?;
@@ -166,7 +171,7 @@ impl Db {
         let rtxn = self.env.read_txn()?;
         let iter = self.db.iter(&rtxn)?;
         for (reference, _) in iter.flatten() {
-            if crate::template::validate_reference(reference).is_ok() {
+            if reference.starts_with("op://") {
                 let _ = Self::keyring_delete(reference);
             }
         }
@@ -187,7 +192,7 @@ impl Db {
         let mut deleted = 0;
 
         for (reference, meta) in &entries {
-            if crate::template::validate_reference(reference).is_err() {
+            if !reference.starts_with("op://") {
                 // A key that is not a secret reference never touches the
                 // keyring; drop its metadata only.
                 let mut wtxn = self.env.write_txn()?;

@@ -391,6 +391,11 @@ impl OpDelegate {
         vault: Option<&str>,
         auth: &CallAuth,
     ) -> Result<serde_json::Value> {
+        // An item or vault that starts with `-` would be parsed as a flag
+        // (e.g. `--debug`) by `op`.
+        if item.starts_with('-') || vault.is_some_and(|v| v.starts_with('-')) {
+            bail!("item and vault names starting with '-' are not supported; use the item ID");
+        }
         let mut args: Vec<OsString> = vec!["item".into(), "get".into(), item.into()];
         if let Some(v) = vault {
             args.push("--vault".into());

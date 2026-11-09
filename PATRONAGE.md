@@ -37,7 +37,7 @@ Added in `0.2.0-patronage.1` (safe to install as the machine-wide `op`):
    binary can still swap it between that check and the exec. Passthrough gives a token only to an
    allowlist of non-executing subcommands, in a strict argv shape (the
    subcommand first, no flag before it or its sub-subcommand, no bare
-   `run`/`plugin`); passthrough `op run` under an
+   `run`/`plugin`, no `--debug`/`--config`); passthrough `op run` under an
    account is refused. Non-macOS: tokens refused for now.
 6. **Fail fast** — delegate deadlines (60 s with a TTY, `prompt_timeout`
    otherwise, minimum 1 s; 30 s for service accounts), killing the whole
@@ -56,13 +56,16 @@ Added in `0.2.0-patronage.1` (safe to install as the machine-wide `op`):
    invoked as `op`, `--version`/`--help`/bare go to real `op`; delegate
    recursion guard; `OP_FAST_BYPASS=1` (op-fast-only commands stay local).
    `run` expands variables before resolving references (unset variables in
-   a reference are errors; `--env-file` values expand, inherited values
-   without references stay byte-identical) and never touches argv; masked
-   output is byte-exact, multi-line secrets are masked per line, and a
+   a reference are errors; `--env-file` values expand and may embed
+   references; an inherited value is a reference only when it is one whole
+   reference, otherwise it stays byte-identical) and never touches argv; masked
+   output is byte-exact, multi-line secrets are masked per line (all matches
+   found on the original line, merged, replaced once), and a
    signal-killed child exits `128 + signal`. References reject control
    characters and never span a newline. A hostile `--env-file` can build a
    reference from environment values, which is then sent to `op` and
-   logged locally. Cache keys must be `op://` references, and the keyring
+   logged locally. Cache keys must be `op://` references (legacy keys with
+   control characters can still be deleted), and the keyring
    service names are compile-time constants in release builds.
 9. **Agent-facing surface** — all commands visible in `--help`;
    `agent-help`, `doctor`, `status`, `ref`; `store list --json`,

@@ -81,15 +81,18 @@ pub fn execute(args: RunArgs, sa: Option<&str>) -> Result<()> {
     }
 
     // Precedence: --env-file entries over the inherited environment.
-    // Inherited values are only touched when they contain a reference
-    // (variables inside the reference are expanded); env-file values are
-    // variable-expanded, reference or not.
+    // An inherited value is a secret reference only when the whole value
+    // (trimmed) is one `op://vault/item/field` reference; its variables are
+    // then expanded strictly. Every other inherited value reaches the child
+    // byte-for-byte. Env-file values are variable-expanded, and references
+    // embedded in larger values are resolved, as before.
     let mut with_refs: BTreeMap<String, String> = BTreeMap::new();
     for (key, value) in std::env::vars_os() {
         if let (Some(key), Some(value)) = (key.to_str(), value.to_str())
-            && value.contains("op://")
+            && template::is_whole_reference(value)
         {
-            with_refs.insert(key.to_string(), template::expand_text(value, false)?);
+            let expanded = template::expand_reference(value.trim())?;
+            with_refs.insert(key.to_string(), expanded);
         }
     }
 
@@ -249,26 +252,42 @@ fn copy_masked<R: std::io::Read, W: Write>(input: R, mut output: W, secrets: &[V
     let _ = output.flush();
 }
 
+/// Replace every occurrence of every secret with the mask in one pass:
+/// all match ranges are found on the original bytes, overlapping and
+/// adjacent ranges are merged, and each merged range is replaced once. Text
+/// that was already masked is never matched again.
 fn mask_bytes(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
-    let mut result = input.to_vec();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     for secret in secrets {
-        if secret.is_empty() {
+        if secret.is_empty() || secret.len() > input.len() {
             continue;
         }
-        let mut out = Vec::with_capacity(result.len());
-        let mut i = 0;
-        while i < result.len() {
-            if result[i..].starts_with(secret) {
-                out.extend_from_slice(MASK.as_bytes());
-                i += secret.len();
-            } else {
-                out.push(result[i]);
-                i += 1;
+        for start in 0..=input.len() - secret.len() {
+            if input[start..].starts_with(secret) {
+                ranges.push((start, start + secret.len()));
             }
         }
-        result = out;
     }
-    result
+    if ranges.is_empty() {
+        return input.to_vec();
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut out = Vec::with_capacity(input.len());
+    let mut pos = 0;
+    for (start, end) in merged {
+        out.extend_from_slice(&input[pos..start]);
+        out.extend_from_slice(MASK.as_bytes());
+        pos = end;
+    }
+    out.extend_from_slice(&input[pos..]);
+    out
 }
 
 #[cfg(test)]
@@ -299,6 +318,49 @@ mod tests {
             mask_bytes(b"-----BEGIN KEY-----\n", &patterns),
             b"<concealed by 1Password>\n".to_vec()
         );
+    }
+
+    fn masked(line: &str, values: &[&str]) -> String {
+        let values: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+        let patterns = mask_patterns(values.iter());
+        String::from_utf8(mask_bytes(line.as_bytes(), &patterns)).unwrap()
+    }
+
+    #[test]
+    fn b8_line_pattern_before_another_secret_does_not_hide_it() {
+        assert_eq!(
+            masked(
+                "FAKEPEMHEAD-12345abcdefSECRET",
+                &["FAKEPEMHEAD-12345ab\nFAKE-PEM-LINE-2", "abcdefSECRET"]
+            ),
+            "<concealed by 1Password>"
+        );
+    }
+
+    #[test]
+    fn b8_patterns_never_match_inside_inserted_mask_text() {
+        for word in ["word", "concealed", "1Password"] {
+            let values = [&*format!("{}\nother-line", word), "s3cr3t-value"];
+            let out = masked("x s3cr3t-value y", &values);
+            assert_eq!(out, "x <concealed by 1Password> y", "{}", word);
+        }
+    }
+
+    #[test]
+    fn b8_overlapping_and_prefix_secrets_mask_once() {
+        assert_eq!(
+            masked("aaXXXXbbbbYY", &["XXXXbb", "bbbbYY"]),
+            "aa<concealed by 1Password>"
+        );
+        assert_eq!(
+            masked("key=TOKEN123456", &["TOKEN", "TOKEN123456"]),
+            "key=<concealed by 1Password>"
+        );
+        assert_eq!(
+            masked("TOKEN and TOKEN123", &["TOKEN123", "TOKEN"]),
+            "<concealed by 1Password> and <concealed by 1Password>"
+        );
+        assert_eq!(masked("abcabc", &["abc"]), "<concealed by 1Password>");
     }
 
     #[test]

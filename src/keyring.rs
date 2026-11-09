@@ -45,6 +45,15 @@ pub fn token_service() -> String {
 
 fn checked_cache_service(reference: &str) -> Result<String> {
     crate::template::validate_reference(reference)?;
+    cache_service_for_key(reference)
+}
+
+/// For deletion only: any key that starts with `op://`, including legacy
+/// keys with control characters, so they can always be cleaned up.
+fn cache_service_for_key(reference: &str) -> Result<String> {
+    if !reference.starts_with("op://") {
+        bail!("not a secret reference (must start with op://)");
+    }
     let service = cache_service();
     if service.ends_with(TOKEN_SUFFIX) {
         bail!("refusing to use a token keyring service for cached secrets");
@@ -65,8 +74,10 @@ pub fn cache_set(reference: &str, value: &str) -> Result<()> {
     set(&checked_cache_service(reference)?, reference, value)
 }
 
+/// Deletion accepts any `op://` key, including legacy keys that reads and
+/// writes refuse (control characters), so they can be removed.
 pub fn cache_delete(reference: &str) -> Result<bool> {
-    delete(&checked_cache_service(reference)?, reference)
+    delete(&cache_service_for_key(reference)?, reference)
 }
 
 pub fn token_get(name: &str) -> Result<Option<String>> {
@@ -251,6 +262,10 @@ mod tests {
             assert!(checked_cache_service(bad).is_err(), "{:?}", bad);
         }
         assert!(checked_cache_service("op://V/i/f").is_ok());
+        // Deletion still works for a legacy key with a control character,
+        // but never for a non-reference.
+        assert!(cache_service_for_key("op://V/i\n/f").is_ok());
+        assert!(cache_service_for_key("agents").is_err());
     }
 
     #[test]

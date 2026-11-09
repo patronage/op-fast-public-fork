@@ -97,6 +97,9 @@ pub fn expand_with<F: Fn(&str) -> Option<String>>(
             let valid = name.chars().next().is_some_and(is_start) && name.chars().all(is_name);
             if valid {
                 match (lookup(name), default) {
+                    // `${VAR:-default}` uses the default when VAR is unset
+                    // or empty, as shells do.
+                    (Some(v), Some(d)) if v.is_empty() => out.push_str(d),
                     (Some(v), _) => out.push_str(&v),
                     (None, Some(d)) => out.push_str(d),
                     (None, None) if strict => {
@@ -127,6 +130,24 @@ pub fn expand_with<F: Fn(&str) -> Option<String>>(
         i += 1;
     }
     Ok(out)
+}
+
+/// Whether `value` (trimmed) is exactly one secret reference of the full
+/// `op://vault/item/field` (or `/section/field`) shape, before variable
+/// expansion. Used for inherited environment values, which are only ever
+/// treated as a reference when they are nothing else.
+pub fn is_whole_reference(value: &str) -> bool {
+    let value = value.trim();
+    let Ok(Some(m)) = RAW_REF.find(value) else {
+        return false;
+    };
+    if m.start() != 0 || m.end() != value.len() {
+        return false;
+    }
+    let path = value.trim_start_matches("op://");
+    let path = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').collect();
+    (3..=4).contains(&segments.len()) && segments.iter().all(|s| !s.trim().is_empty())
 }
 
 /// Expand one secret reference strictly from the process environment.
@@ -246,7 +267,9 @@ mod tests {
         assert_eq!(e("op://${VAULT}/x", true).unwrap(), "op://prod/x");
         assert_eq!(e("op://${NOPE:-dev}/x", true).unwrap(), "op://dev/x");
         assert_eq!(e("op://${NOPE:dev}/x", true).unwrap(), "op://dev/x");
-        assert_eq!(e("op://${EMPTY:-dev}/x", true).unwrap(), "op:///x");
+        assert_eq!(e("op://${EMPTY:-dev}/x", true).unwrap(), "op://dev/x");
+        assert_eq!(e("op://${EMPTY:dev}/x", true).unwrap(), "op://dev/x");
+        assert_eq!(e("op://${EMPTY}x", true).unwrap(), "op://x");
         let err = e("op://$NOPE/x", true).unwrap_err().to_string();
         assert!(err.contains("`NOPE`"), "{}", err);
         assert!(e("op://${NOPE}/x", true).is_err());
@@ -267,6 +290,19 @@ mod tests {
         assert_eq!(t("a $VAULT", false).unwrap(), "a $VAULT");
         assert!(t("x={{ op://$NOPE/i/f }}", true).is_err());
         assert!(t("op://V/$NOPE/f", false).is_err());
+    }
+
+    #[test]
+    fn whole_reference_shape() {
+        assert!(is_whole_reference("op://V/i/f"));
+        assert!(is_whole_reference("  op://$VAULT/i/f \n"));
+        assert!(is_whole_reference("op://V/i/s/f"));
+        assert!(is_whole_reference("op://V/i/otp?attribute=otp"));
+        assert!(!is_whole_reference("op://$VAULT/item"));
+        assert!(!is_whole_reference("use op://vault/item/field syntax"));
+        assert!(!is_whole_reference("https://x.test/?next=op://V/zz"));
+        assert!(!is_whole_reference("op://V//f"));
+        assert!(!is_whole_reference("op://V/i/f op://V/j/f"));
     }
 
     #[test]

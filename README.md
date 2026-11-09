@@ -125,16 +125,21 @@ op-fast run --refresh --env-file .env -- ./deploy.sh
 ```
 
 Variables use `$VAR`, `${VAR}`, or `${VAR:-default}` (`${VAR:default}`
-also works). Inside a secret reference an unset variable with no default is
+also works); as in shells, the default applies when the variable is unset
+or empty. Inside a secret reference an unset variable with no default is
 an error naming the variable, for `read`, `run`, and `inject`; op-fast never
 fetches, caches, or audits a partly expanded reference.
 
 `run` treats the two sources of environment differently:
 
-- `--env-file` values are variable-expanded, reference or not, and win over
-  the inherited environment.
-- Inherited values are passed through byte for byte unless they contain a
-  reference; then only the variables inside the reference are expanded.
+- `--env-file` values are variable-expanded, reference or not, win over the
+  inherited environment, and may embed references in larger values
+  (`DSN=postgres://u:op://V/db/password@host`).
+- An inherited value is treated as a secret reference only when the whole
+  value (trimmed) is one `op://vault/item/field` reference; its variables
+  are then expanded, and an unset one is an error. Every other inherited
+  value, including one that merely mentions `op://`, reaches the child byte
+  for byte. Embedded references are resolved only from `--env-file`.
 
 Treat an `--env-file` like code: a hostile env file can build a reference
 from your environment values (for example `X=op://$SOME_VAR/item/field`).
@@ -146,7 +151,10 @@ variables or substitutes references inside argv, so secrets reach the child
 only through its environment (as with `op run`). Masked output is copied as
 raw bytes, so non-UTF-8 output survives, and op-fast drains it completely
 before exiting. Masking covers each secret and every line of 4 or more
-characters of a multi-line secret, longest first. A child killed by a
+characters of a multi-line secret: op-fast finds every match on the
+original output line, merges overlapping and adjacent matches, and
+replaces each merged range once, so a match never hides another and text
+already masked is never matched again. A child killed by a
 signal makes op-fast exit with `128 + signal`.
 
 A secret reference never spans a newline or tab, keeps query strings such
@@ -244,8 +252,8 @@ op-fast sa remove agents
   caller-supplied program: `read`, `inject`, `item get|list|create|edit|delete|template`,
   `vault get|list`, `document get`, `whoami`, `user get --me`. The
   subcommand must be the first argument (after op-fast's own flags) and its
-  sub-subcommand the next one; any flag before them, or a bare `run` or
-  `plugin` anywhere before `--`, means no token. Any other passthrough runs
+  sub-subcommand the next one; any flag before them, a bare `run` or
+  `plugin`, or `--debug`/`--config` anywhere before `--`, means no token. Any other passthrough runs
   with desktop auth (with a note on stderr), and a passthrough `op run`
   under a selected account is refused. The process
   started by `op-fast run` never sees the token.
@@ -284,6 +292,11 @@ op-fast store clear 'op://vault/item/field'
 # Clear all cached secrets
 op-fast store clear
 ```
+
+Deletion (`store clear`, `store clear '<key>'`, and GC) works for any key
+that starts with `op://`, including legacy keys with control characters,
+and removes the keyring item as well as the metadata. Reads, writes, and
+fetches refuse such keys. `store list` prints control characters escaped.
 
 ### Passthrough
 

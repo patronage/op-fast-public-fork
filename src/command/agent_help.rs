@@ -40,8 +40,9 @@ DO NOT
     commits, or files that are not mode 600.
   - guess at item names with spaces or slashes; use `op-fast ref`.
   - expect `op-fast run` to expand `$VAR` or references in arguments; only
-    environment values are resolved. An unset $VAR inside a reference is
-    an error. Treat --env-file like code: it can build references.
+    environment values are resolved: an inherited value only when it is
+    one whole reference, --env-file values even when embedded. An unset
+    $VAR inside a reference is an error. Treat --env-file like code.
 
 SERVICE ACCOUNTS
   References in vaults listed under [[service_account]] in config.toml are

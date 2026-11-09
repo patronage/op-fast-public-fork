@@ -38,6 +38,10 @@ Makes op-fast safe to install as the machine-wide `op`.
   copies on PATH skip each other; unset variables in references are errors
   and `${VAR:-default}` works; `run` masks multi-line secrets per line and
   maps signals to `128 + signal`; `subst` dependency removed.
+- Round 3: single-pass masking with merged match ranges; no token with
+  `--debug`/`--config`; inherited env values are references only when whole;
+  legacy control-character cache keys can be deleted; `${VAR:-default}`
+  applies to empty values.
 - Fixes: `read`/`run` expand `$VAR` before caching; masked `run` output is
   byte-exact and fully drained; `run` leaves argv untouched; a reference no
   longer swallows a following `op://` or `NAME=` across whitespace.

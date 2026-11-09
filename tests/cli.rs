@@ -1674,17 +1674,19 @@ fn p2_masked_run_is_lossless() {
 
 #[test]
 fn p3_run_expands_env_before_detecting_and_leaves_argv_alone() {
-    let env = Env::new()
-        .with("VV", "Private")
-        .with("X", "op://$VV/i/f")
-        .with("BOTH", "op://Private/i/f C=op://Private/j/f");
+    let env = Env::new().with("VV", "Private").with("X", "op://$VV/i/f");
     env.set_values(&[
         ("op://Private/i/f", "one-fake"),
         ("op://Private/j/f", "two-fake"),
     ]);
+    // Embedded references are resolved only from --env-file (round 3, T2).
+    let file = env.dir.join(".env");
+    fs::write(&file, "BOTH=op://Private/i/f C=op://Private/j/f\n").unwrap();
     let out = env.run(&[
         "run",
         "--no-masking",
+        "--env-file",
+        file.to_str().unwrap(),
         "--",
         "sh",
         "-c",
@@ -1871,7 +1873,6 @@ fn s2_control_characters_in_references_are_rejected_before_anything() {
         vec!["read", spoof],
         vec!["status", spoof],
         vec!["refresh", spoof],
-        vec!["store", "clear", spoof],
         vec!["read", "--account", "x", spoof],
         vec!["read", "op://Private/x\u{1b}[2J/f"],
     ] {
@@ -2190,4 +2191,260 @@ fn s14_inherited_env_without_references_is_byte_identical() {
     let out = env.run(&["run", "--no-masking", "--", "printenv", "ODD"]);
     assert_ok(&out);
     assert_eq!(stdout(&out), format!("{}\n", odd));
+}
+
+// ------------------------------------------------------ review round 3
+
+#[test]
+fn b8_run_masks_a_line_pattern_followed_by_another_secret() {
+    let env = Env::new()
+        .with("PEM", "op://Private/pem/f")
+        .with("S", "op://Private/s/f");
+    env.set_values(&[
+        (
+            "op://Private/pem/f",
+            "FAKEPEMHEAD-12345ab\\nFAKE-PEM-LINE-2",
+        ),
+        ("op://Private/s/f", "abcdefSECRET"),
+    ]);
+    let out = env.run(&[
+        "run",
+        "--",
+        "sh",
+        "-c",
+        "echo FAKEPEMHEAD-12345abcdefSECRET; echo FAKE-PEM-LINE-2; echo plain",
+    ]);
+    assert_ok(&out);
+    assert_eq!(
+        stdout(&out),
+        "<concealed by 1Password>\n<concealed by 1Password>\nplain\n"
+    );
+    // A short line pattern never matches inside inserted mask text.
+    env.set_values(&[
+        ("op://Private/pem/f", "concealed\\nword"),
+        ("op://Private/s/f", "abcdefSECRET"),
+    ]);
+    let out = env.run(&["run", "--refresh", "--", "echo", "x abcdefSECRET y"]);
+    assert_eq!(stdout(&out), "x <concealed by 1Password> y\n");
+}
+
+#[test]
+fn t1_debug_or_config_flags_never_get_a_token() {
+    let env = sa_env();
+    for args in [
+        vec![
+            "--sa",
+            "agents",
+            "read",
+            "--debug",
+            "--account",
+            "x",
+            "op://Agents/a/f",
+        ],
+        vec!["item", "list", "--vault", "Agents", "--debug"],
+        vec![
+            "item",
+            "list",
+            "--vault",
+            "Agents",
+            "--config",
+            "/tmp/fake-op-config",
+        ],
+        vec![
+            "item",
+            "list",
+            "--vault",
+            "Agents",
+            "--config=/tmp/fake-op-config",
+        ],
+    ] {
+        env.clear_calls();
+        let out = env.run(&args);
+        assert_ok(&out);
+        assert!(
+            stderr(&out).contains("is not used for"),
+            "{:?}: {}",
+            args,
+            stderr(&out)
+        );
+        assert_eq!(env.calls()[0].0, "unset", "{:?}", args);
+        assert_no_token_leak(&env, &[&out]);
+    }
+    // `ref` refuses an item name that `op` would parse as a flag.
+    let out = env.run(&["ref", "--vault", "Agents", "--", "--debug"]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn t2_inherited_values_are_references_only_when_whole() {
+    let env = Env::new()
+        .with("DOC", "op://$VAULT_UNSET_T2/item")
+        .with("DOC2", "use op://vault/item/field syntax")
+        .with("URL", "https://x.test/?next=op://V/zz")
+        .with("A", "op://V/i/f");
+    env.set_values(&[("op://V/i/f", "resolved-fake")]);
+    let out = env.run(&[
+        "run",
+        "--no-masking",
+        "--",
+        "sh",
+        "-c",
+        "printenv DOC; printenv DOC2; printenv URL; printenv A",
+    ]);
+    assert_ok(&out);
+    assert_eq!(
+        stdout(&out),
+        "op://$VAULT_UNSET_T2/item\nuse op://vault/item/field syntax\nhttps://x.test/?next=op://V/zz\nresolved-fake\n"
+    );
+    let calls = env.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].1.iter().any(|a| a == "stdin:op://V/i/f"));
+
+    // A whole-value inherited reference with an unset variable is still
+    // the named error.
+    let env = Env::new().with("W", "op://$VAULT_UNSET_T2/item/field");
+    let out = env.run(&["run", "--", "true"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("VAULT_UNSET_T2"));
+}
+
+/// Plant a legacy cache entry (a key with a control character) directly in
+/// the test store and the debug-only test keyring.
+fn plant_legacy_entry(env: &Env, key: &str) -> PathBuf {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Meta {
+        stored_at: u64,
+        ttl_seconds: u64,
+    }
+    let store = env.dir.join("store");
+    fs::create_dir_all(&store).unwrap();
+    let lmdb = unsafe {
+        heed::EnvOpenOptions::new()
+            .max_dbs(1)
+            .map_size(10 * 1024 * 1024)
+            .open(&store)
+            .unwrap()
+    };
+    let mut wtxn = lmdb.write_txn().unwrap();
+    let db: heed::Database<heed::types::Str, heed::types::SerdeBincode<Meta>> =
+        lmdb.create_database(&mut wtxn, None).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    db.put(
+        &mut wtxn,
+        key,
+        &Meta {
+            stored_at: now,
+            ttl_seconds: 3600,
+        },
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+    drop(lmdb);
+    let hex = |s: &str| s.bytes().map(|b| format!("{:02x}", b)).collect::<String>();
+    let item = env
+        .dir
+        .join("keyring")
+        .join(hex("op-fast-integration-test"))
+        .join(hex(key));
+    fs::create_dir_all(item.parent().unwrap()).unwrap();
+    fs::write(&item, "legacy-fake-value").unwrap();
+    item
+}
+
+#[test]
+fn t3_legacy_control_character_keys_can_be_deleted_but_not_read() {
+    let key = "op://Private/legacy\nitem/f";
+
+    // store clear <key> removes keyring item and metadata.
+    let env = Env::new();
+    let item = plant_legacy_entry(&env, key);
+    let list = env.run(&["store", "list"]);
+    assert!(
+        stdout(&list).contains("op://Private/legacy\\nitem/f"),
+        "{}",
+        stdout(&list)
+    );
+    assert!(!stdout(&list).contains("legacy\nitem"));
+    assert!(
+        !env.run(&["read", key]).status.success(),
+        "reads still refuse it"
+    );
+    let out = env.run(&["store", "clear", key]);
+    assert_ok(&out);
+    assert!(stdout(&out).contains("Deleted: op://Private/legacy\\nitem/f"));
+    assert!(!item.exists(), "keyring item removed");
+    assert_eq!(stdout(&env.run(&["store", "list"])), "Store is empty\n");
+
+    // store clear (all) removes it too.
+    let env = Env::new();
+    let item = plant_legacy_entry(&env, key);
+    assert_ok(&env.run(&["store", "clear"]));
+    assert!(!item.exists());
+
+    // GC removes it once it is past the grace window (planted long expired).
+    let env2 = Env::new();
+    env2.config("stale_grace = \"1s\"\n");
+    {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Meta {
+            stored_at: u64,
+            ttl_seconds: u64,
+        }
+        let store = env2.dir.join("store");
+        fs::create_dir_all(&store).unwrap();
+        let lmdb = unsafe {
+            heed::EnvOpenOptions::new()
+                .max_dbs(1)
+                .map_size(10 * 1024 * 1024)
+                .open(&store)
+                .unwrap()
+        };
+        let mut wtxn = lmdb.write_txn().unwrap();
+        let db: heed::Database<heed::types::Str, heed::types::SerdeBincode<Meta>> =
+            lmdb.create_database(&mut wtxn, None).unwrap();
+        db.put(
+            &mut wtxn,
+            key,
+            &Meta {
+                stored_at: 1_000,
+                ttl_seconds: 1,
+            },
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+    }
+    let hex = |s: &str| s.bytes().map(|b| format!("{:02x}", b)).collect::<String>();
+    let item2 = env2
+        .dir
+        .join("keyring")
+        .join(hex("op-fast-integration-test"))
+        .join(hex(key));
+    fs::create_dir_all(item2.parent().unwrap()).unwrap();
+    fs::write(&item2, "legacy-fake-value").unwrap();
+    let env2 = env2.with("OP_FAST_TEST_FORCE_GC", "1");
+    assert_ok(&env2.run(&["store", "list"]));
+    assert!(!item2.exists(), "GC removed the legacy keyring item");
+    assert_eq!(stdout(&env2.run(&["store", "list"])), "Store is empty\n");
+}
+
+#[test]
+fn t4_default_applies_when_variable_is_empty() {
+    let env = Env::new().with("EMPTY_T4", "");
+    env.set_values(&[("op://Private/db/password", "v")]);
+    let out = env.run(&["read", "op://${EMPTY_T4:-Private}/db/password"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "v\n");
+}
+
+#[test]
+fn t5_unmodeled_flag_on_external_subcommand_keeps_refresh() {
+    let env = Env::new();
+    assert_ok(&env.run(&["--format", "json", "item", "list", "--refresh"]));
+    assert_eq!(
+        args_of(&env.calls()[0]),
+        ["--format", "json", "item", "list", "--refresh"]
+    );
 }

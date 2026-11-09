@@ -198,8 +198,8 @@ fn flag_value<'a>(args: &'a [OsString], name: &str) -> Option<&'a str> {
 ///
 /// Strict shape: the subcommand must be the very first argument and its
 /// sub-subcommand (for `item`, `vault`, `document`, `user`) the next one.
-/// Any flag before them, or a bare `run`/`plugin` anywhere before `--`,
-/// means no token: `op` may parse such an argv differently than we do.
+/// Any flag before them, a bare `run`/`plugin`, or `--debug`/`--config`
+/// anywhere before `--` means no token.
 pub fn token_allowed(args: &[OsString]) -> bool {
     let words: Vec<&str> = args
         .iter()
@@ -207,6 +207,14 @@ pub fn token_allowed(args: &[OsString]) -> bool {
         .take_while(|a| *a != "--")
         .collect();
     if words.iter().any(|w| matches!(*w, "run" | "plugin")) {
+        return false;
+    }
+    // `--debug` and `--config` change what `op` prints and where it reads
+    // state from; never combine them with a token.
+    if words
+        .iter()
+        .any(|w| *w == "--debug" || *w == "--config" || w.starts_with("--config="))
+    {
         return false;
     }
     let first = words.first().copied();
@@ -457,6 +465,10 @@ mod tests {
         assert!(!ok(&["--format", "json", "item", "list"]));
         assert!(!ok(&["item", "--vault", "X", "get", "y"]));
         assert!(!ok(&["read", "plugin"]));
+        assert!(!ok(&["read", "op://a/b/c", "--debug"]));
+        assert!(!ok(&["item", "list", "--config", "/tmp/x"]));
+        assert!(!ok(&["item", "list", "--config=/tmp/x"]));
+        assert!(ok(&["read", "op://a/b/c", "--", "--debug"]));
         assert!(ok(&["read", "op://a/b/c", "--", "run"]));
         for cmd in [
             "plugin",
