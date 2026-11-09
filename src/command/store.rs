@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::config::Config;
 use crate::store::Store;
 
 #[derive(Debug, Parser)]
@@ -13,6 +14,7 @@ based on the configured TTL (time-to-live).",
     after_help = "Examples:
   List all cached secrets:
     op-fast store list
+    op-fast store list --json
 
   Clear a specific secret:
     op-fast store clear 'op://vault/item/field'
@@ -28,8 +30,11 @@ pub struct StoreCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum StoreSubcommand {
-    #[clap(about = "List all cached secrets")]
-    List,
+    #[clap(about = "List all cached secrets (references and timestamps, never values)")]
+    List {
+        #[clap(long, help = "Print JSON")]
+        json: bool,
+    },
 
     #[clap(about = "Clear cached secrets")]
     Clear {
@@ -39,11 +44,34 @@ pub enum StoreSubcommand {
 }
 
 pub fn execute(cmd: StoreCommand) -> Result<()> {
-    let store = Store::open()?;
+    let config = Config::load_or_default();
+    let store = Store::open(config.stale_grace)?;
 
     match cmd.command {
-        StoreSubcommand::List => {
+        StoreSubcommand::List { json } => {
             let entries = store.list()?;
+            if json {
+                let rows: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|(reference, meta)| {
+                        let state = if !meta.is_expired() {
+                            "valid"
+                        } else if meta.is_in_grace(config.stale_grace) {
+                            "expired-in-grace"
+                        } else {
+                            "expired"
+                        };
+                        serde_json::json!({
+                            "reference": reference,
+                            "stored_at": meta.stored_at,
+                            "expires_at": meta.expires_at(),
+                            "state": state,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
             if entries.is_empty() {
                 println!("Store is empty");
                 return Ok(());
@@ -53,10 +81,12 @@ pub fn execute(cmd: StoreCommand) -> Result<()> {
             println!("{}", "-".repeat(90));
 
             for (reference, meta) in entries {
-                let status = if meta.is_expired() {
-                    "expired"
-                } else {
+                let status = if !meta.is_expired() {
                     "valid"
+                } else if meta.is_in_grace(config.stale_grace) {
+                    "expired-in-grace"
+                } else {
+                    "expired"
                 };
                 let stored_at = chrono_conversion(meta.stored_at);
                 println!("{:<60} {:<20} {}", reference, stored_at, status);

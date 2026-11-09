@@ -1,0 +1,99 @@
+#!/bin/sh
+# Fake 1Password CLI for op-fast integration tests. Never touches 1Password.
+#
+# Environment (all optional):
+#   FAKE_OP_VALUES  file of "<reference>\t<value>" lines, re-read every call
+#   FAKE_OP_LOG     append one line per call: "<token-label>\t<args...>"
+#                   (inject calls append "\tstdin:<ref>" for each reference)
+#   FAKE_OP_TOKENS  file of "<token>\t<label>" lines; the log records the
+#                   label for OP_SERVICE_ACCOUNT_TOKEN, never the token
+#   FAKE_OP_STDERR  fail every call (except --version) with this stderr
+#   FAKE_OP_EXIT    exit code for FAKE_OP_STDERR / missing values (default 1)
+#   FAKE_OP_FAIL_DESKTOP_ONLY  only fail when no token is set
+#   FAKE_OP_SLEEP   sleep this many seconds before answering
+#   FAKE_OP_ITEM_JSON  file printed for `item get`
+
+code="${FAKE_OP_EXIT:-1}"
+
+if [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+  label="unknown"
+  if [ -n "${FAKE_OP_TOKENS:-}" ] && [ -f "$FAKE_OP_TOKENS" ]; then
+    found=$(awk -F '\t' -v t="$OP_SERVICE_ACCOUNT_TOKEN" '$1 == t { print $2; exit }' "$FAKE_OP_TOKENS")
+    [ -n "$found" ] && label="$found"
+  fi
+else
+  label="unset"
+fi
+
+stdin_refs=""
+if [ "${1:-}" = "inject" ]; then
+  template=$(cat)
+  stdin_refs=$(printf '%s\n' "$template" | awk '/^op:\/\// { printf "\tstdin:%s", $0 }')
+fi
+
+if [ -n "${FAKE_OP_LOG:-}" ]; then
+  line="$label"
+  for a in "$@"; do line="$line	$a"; done
+  printf '%s%s\n' "$line" "$stdin_refs" >> "$FAKE_OP_LOG"
+fi
+
+if [ "${1:-}" = "--version" ]; then
+  echo "2.99.0-fake"
+  exit 0
+fi
+
+if [ -n "${FAKE_OP_SLEEP:-}" ]; then
+  exec sleep "$FAKE_OP_SLEEP"
+fi
+
+if [ -n "${FAKE_OP_STDERR:-}" ]; then
+  if [ -z "${FAKE_OP_FAIL_DESKTOP_ONLY:-}" ] || [ "$label" = "unset" ]; then
+    echo "$FAKE_OP_STDERR" >&2
+    exit "$code"
+  fi
+fi
+
+lookup() {
+  [ -n "${FAKE_OP_VALUES:-}" ] && [ -f "$FAKE_OP_VALUES" ] || return 1
+  awk -F '\t' -v r="$1" '$1 == r { print $2; found = 1; exit } END { exit !found }' "$FAKE_OP_VALUES"
+}
+
+not_found() {
+  echo "[ERROR] 2026/11/09 12:00:00 could not read secret '$1': \"item\" isn't an item in the \"vault\" vault" >&2
+  exit "$code"
+}
+
+case "${1:-}" in
+  read)
+    ref=""
+    for a in "$@"; do
+      case "$a" in op://*) ref="$a" ;; esac
+    done
+    value=$(lookup "$ref") || not_found "$ref"
+    printf '%s\n' "$value"
+    ;;
+  inject)
+    out=""
+    nl='
+'
+    while IFS= read -r l; do
+      case "$l" in
+        op://*) v=$(lookup "$l") || not_found "$l"; out="$out$v$nl" ;;
+        *) out="$out$l$nl" ;;
+      esac
+    done <<TEMPLATE
+$template
+TEMPLATE
+    printf '%s' "$out"
+    ;;
+  item)
+    if [ "${2:-}" = "get" ] && [ -n "${FAKE_OP_ITEM_JSON:-}" ]; then
+      cat "$FAKE_OP_ITEM_JSON"
+    else
+      echo "fake-op: $*"
+    fi
+    ;;
+  *)
+    echo "fake-op: $*"
+    ;;
+esac

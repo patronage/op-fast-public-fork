@@ -48,7 +48,9 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open() -> anyhow::Result<Self> {
+    /// Open the store. `stale_grace` bounds how long expired entries are
+    /// kept for stale-on-auth-failure before background GC removes them.
+    pub fn open(stale_grace: Duration) -> anyhow::Result<Self> {
         let db = Db::open()?;
         let store = Self { db };
 
@@ -57,12 +59,18 @@ impl Store {
             .unwrap()
             .as_secs();
         if now.is_multiple_of(10)
-            && let Err(e) = store.db.gc()
+            && let Err(e) = store.db.gc(stale_grace)
         {
             log::warn!("Background GC failed: {}", e);
         }
 
         Ok(store)
+    }
+
+    /// Open without background GC (GC may delete keyring items, which can
+    /// raise a Keychain prompt). For read-only reporting commands.
+    pub fn open_read_only() -> anyhow::Result<Self> {
+        Ok(Self { db: Db::open()? })
     }
 
     pub fn get_with_meta(&self, reference: &str) -> anyhow::Result<Option<(String, Meta)>> {
@@ -76,6 +84,20 @@ impl Store {
                 Ok(None)
             }
         }
+    }
+
+    /// Entry regardless of expiry.
+    pub fn get_any(&self, reference: &str) -> anyhow::Result<Option<(String, Meta)>> {
+        self.db.get_any(reference)
+    }
+
+    /// Metadata only; never touches the keyring.
+    pub fn meta(&self, reference: &str) -> anyhow::Result<Option<Meta>> {
+        self.db.meta(reference)
+    }
+
+    pub fn path() -> anyhow::Result<std::path::PathBuf> {
+        Db::db_path()
     }
 
     pub fn put(&self, reference: &str, value: &str, ttl: Duration) -> anyhow::Result<()> {

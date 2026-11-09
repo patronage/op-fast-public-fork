@@ -4,8 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueHint};
 
 use crate::config::Config;
-use crate::delegate::OpDelegate;
-use crate::store::Store;
+use crate::fetch::Fetcher;
 
 fn parse_file_mode(s: &str) -> Result<u32> {
     u32::from_str_radix(s, 8).context("Invalid file mode (expected octal)")
@@ -31,6 +30,12 @@ https://developer.1password.com/docs/cli/secrets-reference-syntax/",
 
   Save to a file with restricted permissions:
     op-fast read -o ./key.pem op://app-prod/ssh/private-key
+
+  Bypass the cache after a rotation (overwrites the cached entry):
+    op-fast read --refresh op://app-prod/db/password
+
+Flags op-fast does not model (--account, --format, ...) send the whole
+invocation to the real `op` unchanged.
 "
 )]
 pub struct ReadArgs {
@@ -46,8 +51,18 @@ pub struct ReadArgs {
     )]
     pub file_mode: u32,
 
-    #[clap(short = 'f', long = "force", help = "Do not prompt for confirmation")]
+    #[clap(
+        short = 'f',
+        long = "force",
+        help = "Do not prompt for confirmation (does NOT refresh the cache; see --refresh)"
+    )]
     pub force: bool,
+
+    #[clap(
+        long = "refresh",
+        help = "Bypass the cache, fetch from 1Password, and overwrite the cached entry"
+    )]
+    pub refresh: bool,
 
     #[clap(
         short = 'n',
@@ -66,44 +81,17 @@ pub struct ReadArgs {
     pub out_file: Option<PathBuf>,
 }
 
-pub fn execute(args: ReadArgs) -> Result<()> {
+pub fn execute(args: ReadArgs, sa: Option<&str>) -> Result<()> {
+    if args.force && args.out_file.is_none() {
+        eprintln!("note: -f does not refresh the cache; use --refresh");
+    }
+
     let config = Config::load()?;
-    let store = Store::open();
-    let delegate = OpDelegate::new()?;
-
-    let fetch = |reference: &str| {
-        delegate.read(reference).inspect_err(|_| {
-            crate::audit::record("read", Some(reference), "error", None, None);
-        })
-    };
-
-    let value = match store {
-        Ok(store) => match store.get_with_meta(&args.reference)? {
-            Some((value, meta)) => {
-                crate::audit::record(
-                    "read",
-                    Some(&args.reference),
-                    "hit",
-                    Some(meta.remaining_secs()),
-                    None,
-                );
-                value
-            }
-            None => {
-                let value = fetch(&args.reference)?;
-                crate::audit::record("read", Some(&args.reference), "fetched", None, None);
-                let ttl = config.resolve_ttl(&args.reference);
-                store.put(&args.reference, &value, ttl)?;
-                value
-            }
-        },
-        Err(e) => {
-            log::error!("Store unavailable, delegating to op: {}", e);
-            let value = fetch(&args.reference)?;
-            crate::audit::record("read", Some(&args.reference), "fetched", None, None);
-            value
-        }
-    };
+    let fetcher = Fetcher::new(&config, sa, "read")?;
+    let mut values = fetcher.resolve(std::slice::from_ref(&args.reference), args.refresh)?;
+    let value = values
+        .remove(&args.reference)
+        .context("op returned no value for the reference")?;
 
     if let Some(out_file) = &args.out_file {
         crate::output::write_secret_file(out_file, value.as_bytes(), args.file_mode)?;

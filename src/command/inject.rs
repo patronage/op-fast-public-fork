@@ -5,8 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueHint};
 
 use crate::config::Config;
-use crate::delegate::OpDelegate;
-use crate::store::Store;
+use crate::fetch::Fetcher;
 use crate::template;
 
 fn parse_file_mode(s: &str) -> Result<u32> {
@@ -80,9 +79,15 @@ pub struct InjectArgs {
 
     #[clap(short = 'f', long = "force", help = "Do not prompt for confirmation")]
     pub force: bool,
+
+    #[clap(
+        long = "refresh",
+        help = "Bypass the cache, fetch from 1Password, and overwrite cached entries"
+    )]
+    pub refresh: bool,
 }
 
-pub fn execute(args: InjectArgs) -> Result<()> {
+pub fn execute(args: InjectArgs, sa: Option<&str>) -> Result<()> {
     let input_path = args.in_file.as_ref().or(args.file.as_ref());
 
     let input = match input_path {
@@ -105,56 +110,8 @@ pub fn execute(args: InjectArgs) -> Result<()> {
         resolved
     } else {
         let config = Config::load()?;
-        let store = Store::open();
-        let delegate = OpDelegate::new()?;
-
-        let mut stored_values = std::collections::HashMap::new();
-        let mut uncached_refs = Vec::new();
-
-        match &store {
-            Ok(store) => {
-                for ref_str in &references {
-                    match store.get_with_meta(ref_str)? {
-                        Some((value, meta)) => {
-                            crate::audit::record(
-                                "inject",
-                                Some(ref_str),
-                                "hit",
-                                Some(meta.remaining_secs()),
-                                None,
-                            );
-                            stored_values.insert(ref_str.clone(), value);
-                        }
-                        None => {
-                            uncached_refs.push(ref_str.as_str());
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("Store unavailable: {}", e);
-                uncached_refs = references.iter().map(|s| s.as_str()).collect();
-            }
-        }
-
-        if !uncached_refs.is_empty() {
-            log::debug!("Fetching {} uncached references", uncached_refs.len());
-            let fetched = delegate.read_batch(&uncached_refs).inspect_err(|_| {
-                crate::audit::record("inject", None, "error", None, None);
-            })?;
-            for ref_str in &uncached_refs {
-                crate::audit::record("inject", Some(ref_str), "fetched", None, None);
-            }
-
-            if let Ok(store) = &store {
-                for (ref_str, value) in &fetched {
-                    let ttl = config.resolve_ttl(ref_str);
-                    store.put(ref_str, value, ttl)?;
-                }
-            }
-
-            stored_values.extend(fetched);
-        }
+        let fetcher = Fetcher::new(&config, sa, "inject")?;
+        let stored_values = fetcher.resolve(&references, args.refresh)?;
 
         template::substitute_references(&resolved, |ref_str| stored_values.get(ref_str).cloned())
     };

@@ -3,12 +3,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use heed::{Database, Env, EnvOpenOptions};
-use keyring_core::Entry as KeyringEntry;
 use serde::{Deserialize, Serialize};
 
 const DIR_NAME: &str = "op-fast";
 const DB_NAME: &str = "store.mdb";
-const SERVICE_NAME: &str = "op-fast";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
@@ -34,6 +32,28 @@ impl Meta {
             .unwrap()
             .as_secs();
         now > self.stored_at + self.ttl_seconds
+    }
+
+    pub fn expires_at(&self) -> u64 {
+        self.stored_at.saturating_add(self.ttl_seconds)
+    }
+
+    /// Seconds since this entry expired, or `None` while it is still valid.
+    pub fn expired_for_secs(&self) -> Option<u64> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if now > self.expires_at() {
+            Some(now - self.expires_at())
+        } else {
+            None
+        }
+    }
+
+    /// Expired, but by no more than `grace`.
+    pub fn is_in_grace(&self, grace: Duration) -> bool {
+        matches!(self.expired_for_secs(), Some(age) if age <= grace.as_secs())
     }
 
     pub fn remaining_secs(&self) -> u64 {
@@ -70,6 +90,19 @@ impl Db {
     }
 
     pub fn get(&self, reference: &str) -> Result<Option<(String, Meta)>> {
+        match self.get_any(reference)? {
+            Some((_, meta)) if meta.is_expired() => Ok(None),
+            other => Ok(other),
+        }
+    }
+
+    pub fn meta(&self, reference: &str) -> Result<Option<Meta>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.db.get(&rtxn, reference)?)
+    }
+
+    /// Entry regardless of expiry (used for stale-on-auth-failure).
+    pub fn get_any(&self, reference: &str) -> Result<Option<(String, Meta)>> {
         let meta = {
             let rtxn = self.env.read_txn()?;
             let Some(meta) = self.db.get(&rtxn, reference)? else {
@@ -77,10 +110,6 @@ impl Db {
             };
             meta
         };
-
-        if meta.is_expired() {
-            return Ok(None);
-        }
 
         match Self::keyring_get(reference)? {
             Some(value) => Ok(Some((value, meta))),
@@ -144,12 +173,15 @@ impl Db {
         Ok(())
     }
 
-    pub fn gc(&self) -> Result<usize> {
+    /// Delete entries that expired more than `grace` ago. Entries inside the
+    /// grace window are kept so they can be served stale when 1Password
+    /// approval is unavailable.
+    pub fn gc(&self, grace: Duration) -> Result<usize> {
         let entries = self.list()?;
         let mut deleted = 0;
 
         for (reference, meta) in &entries {
-            if meta.is_expired() {
+            if meta.is_expired() && !meta.is_in_grace(grace) {
                 self.delete(reference)?;
                 deleted += 1;
             }
@@ -162,7 +194,7 @@ impl Db {
         Ok(deleted)
     }
 
-    fn db_path() -> Result<PathBuf> {
+    pub fn db_path() -> Result<PathBuf> {
         if let Ok(path) = std::env::var("OP_FAST_STORE_DIR") {
             return Ok(PathBuf::from(path));
         }
@@ -175,34 +207,15 @@ impl Db {
         Ok(data_dir.join(DIR_NAME).join(DB_NAME))
     }
 
-    fn keyring_entry(reference: &str) -> Result<KeyringEntry> {
-        KeyringEntry::new(SERVICE_NAME, reference).context("Failed to create keyring entry")
-    }
-
     fn keyring_get(reference: &str) -> Result<Option<String>> {
-        let entry = Self::keyring_entry(reference)?;
-
-        match entry.get_password() {
-            Ok(value) => Ok(Some(value)),
-            Err(keyring_core::Error::NoEntry) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("Keyring error: {}", e)),
-        }
+        crate::keyring::get(&crate::keyring::cache_service(), reference)
     }
 
     fn keyring_put(reference: &str, value: &str) -> Result<()> {
-        let entry = Self::keyring_entry(reference)?;
-        entry
-            .set_password(value)
-            .context("Failed to store value in keyring")
+        crate::keyring::set(&crate::keyring::cache_service(), reference, value)
     }
 
     fn keyring_delete(reference: &str) -> Result<bool> {
-        let entry = Self::keyring_entry(reference)?;
-
-        match entry.delete_credential() {
-            Ok(()) => Ok(true),
-            Err(keyring_core::Error::NoEntry) => Ok(false),
-            Err(e) => Err(anyhow::anyhow!("Keyring error: {}", e)),
-        }
+        crate::keyring::delete(&crate::keyring::cache_service(), reference)
     }
 }

@@ -7,8 +7,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::config::Config;
-use crate::delegate::OpDelegate;
-use crate::store::Store;
+use crate::fetch::Fetcher;
 use crate::template;
 
 const MASK: &str = "<concealed by 1Password>";
@@ -64,14 +63,19 @@ pub struct RunArgs {
     pub no_masking: bool,
 
     #[clap(
+        long = "refresh",
+        help = "Bypass the cache, fetch from 1Password, and overwrite cached entries"
+    )]
+    pub refresh: bool,
+
+    #[clap(
         trailing_var_arg = true,
-        allow_hyphen_values = true,
         help = "Command to run (use -- to separate flags)"
     )]
     pub command: Vec<String>,
 }
 
-pub fn execute(args: RunArgs) -> Result<()> {
+pub fn execute(args: RunArgs, sa: Option<&str>) -> Result<()> {
     if args.command.is_empty() {
         anyhow::bail!("No command specified");
     }
@@ -120,57 +124,13 @@ pub fn execute(args: RunArgs) -> Result<()> {
         .into_iter()
         .collect();
 
-    let config = Config::load()?;
-    let store = Store::open();
-    let delegate = OpDelegate::new()?;
-
-    let mut stored_values: HashMap<String, String> = HashMap::new();
-    let mut uncached_refs: Vec<&str> = Vec::new();
-
-    match &store {
-        Ok(store) => {
-            for ref_str in &references {
-                match store.get_with_meta(ref_str)? {
-                    Some((value, meta)) => {
-                        crate::audit::record(
-                            "run",
-                            Some(ref_str),
-                            "hit",
-                            Some(meta.remaining_secs()),
-                            None,
-                        );
-                        stored_values.insert(ref_str.clone(), value);
-                    }
-                    None => {
-                        uncached_refs.push(ref_str);
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            log::error!("Store unavailable: {}", e);
-            uncached_refs = references.iter().map(|s| s.as_str()).collect();
-        }
-    }
-
-    if !uncached_refs.is_empty() {
-        log::debug!("Fetching {} uncached references", uncached_refs.len());
-        let fetched = delegate.read_batch(&uncached_refs).inspect_err(|_| {
-            crate::audit::record("run", None, "error", None, None);
-        })?;
-        for ref_str in &uncached_refs {
-            crate::audit::record("run", Some(ref_str), "fetched", None, None);
-        }
-
-        if let Ok(store) = &store {
-            for (ref_str, value) in &fetched {
-                let ttl = config.resolve_ttl(ref_str);
-                store.put(ref_str, value, ttl)?;
-            }
-        }
-
-        stored_values.extend(fetched);
-    }
+    let stored_values: HashMap<String, String> = if references.is_empty() {
+        HashMap::new()
+    } else {
+        let config = Config::load()?;
+        let fetcher = Fetcher::new(&config, sa, "run")?;
+        fetcher.resolve(&references, args.refresh)?
+    };
 
     let resolver = |ref_str: &str| stored_values.get(ref_str).cloned();
 

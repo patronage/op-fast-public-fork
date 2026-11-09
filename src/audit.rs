@@ -11,6 +11,13 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_CHAIN: usize = 8;
+const SESSION_VARS: [&str; 3] = [
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_SESSION_ID",
+    "PI_SESSION_ID",
+];
 
 #[derive(Debug, Serialize)]
 pub struct Event<'a> {
@@ -26,6 +33,24 @@ pub struct Event<'a> {
     pub pid: u32,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub chain: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+/// What to record. Fields beyond `op` and `outcome` are optional.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Entry<'a> {
+    pub op: &'static str,
+    pub reference: Option<&'a str>,
+    pub outcome: &'static str,
+    pub ttl_remaining: Option<u64>,
+    pub command: Option<&'a str>,
+    pub error_class: Option<&'static str>,
+    pub account: Option<&'a str>,
 }
 
 /// Record one audit event. Never fails; never blocks the caller.
@@ -36,33 +61,40 @@ pub fn record(
     ttl_remaining: Option<u64>,
     command: Option<&str>,
 ) {
-    if let Err(e) = try_record(op, reference, outcome, ttl_remaining, command) {
+    log(Entry {
+        op,
+        reference,
+        outcome,
+        ttl_remaining,
+        command,
+        ..Entry::default()
+    });
+}
+
+/// Record one audit event with the full set of fields.
+pub fn log(entry: Entry<'_>) {
+    if let Err(e) = try_record(entry) {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| eprintln!("[op-fast] warning: audit log unavailable: {}", e));
     }
 }
 
-fn try_record(
-    op: &'static str,
-    reference: Option<&str>,
-    outcome: &'static str,
-    ttl_remaining: Option<u64>,
-    command: Option<&str>,
-) -> anyhow::Result<()> {
+fn try_record(entry: Entry<'_>) -> anyhow::Result<()> {
     use anyhow::Context;
 
     let dir = audit_dir().context("could not determine audit directory")?;
-    try_record_to(&dir, op, reference, outcome, ttl_remaining, command)
+    try_record_to(&dir, entry)
 }
 
-fn try_record_to(
-    dir: &std::path::Path,
-    op: &'static str,
-    reference: Option<&str>,
-    outcome: &'static str,
-    ttl_remaining: Option<u64>,
-    command: Option<&str>,
-) -> anyhow::Result<()> {
+/// First set agent session id, so log lines can be tied to a session.
+fn session_id() -> Option<String> {
+    SESSION_VARS
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .find(|v| !v.is_empty())
+}
+
+fn try_record_to(dir: &std::path::Path, entry: Entry<'_>) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
@@ -99,13 +131,16 @@ fn try_record_to(
 
     let event = Event {
         ts: now,
-        op,
-        reference,
-        outcome,
-        ttl_remaining,
-        command,
+        op: entry.op,
+        reference: entry.reference,
+        outcome: entry.outcome,
+        ttl_remaining: entry.ttl_remaining,
+        command: entry.command,
         pid: std::process::id(),
         chain: process_chain(),
+        error_class: entry.error_class,
+        account: entry.account,
+        session: session_id(),
     };
     let line = serde_json::to_string(&event)?;
 
@@ -149,12 +184,14 @@ pub(crate) fn audit_dir() -> Option<PathBuf> {
         .map(|dir| dir.join("op-fast").join("audit"))
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub(crate) struct Summary {
     pub total: usize,
     pub malformed: usize,
     pub by_outcome: BTreeMap<String, usize>,
     pub by_reference: BTreeMap<String, usize>,
+    pub by_error_class: BTreeMap<String, usize>,
+    pub by_account: BTreeMap<String, usize>,
 }
 
 /// Aggregate parsed JSONL lines into counts. Malformed lines are counted,
@@ -172,12 +209,14 @@ pub(crate) fn summarize<'a, I: Iterator<Item = &'a str>>(lines: I) -> Summary {
                 if let Some(outcome) = value.get("outcome").and_then(|v| v.as_str()) {
                     *summary.by_outcome.entry(outcome.to_string()).or_insert(0) += 1;
                 }
-                if let Some(reference) = value.get("reference").and_then(|v| v.as_str()) {
-                    *summary
-                        .by_reference
-                        .entry(reference.to_string())
-                        .or_insert(0) += 1;
-                }
+                let bump = |map: &mut BTreeMap<String, usize>, key: &str| {
+                    if let Some(k) = value.get(key).and_then(|v| v.as_str()) {
+                        *map.entry(k.to_string()).or_insert(0) += 1;
+                    }
+                };
+                bump(&mut summary.by_reference, "reference");
+                bump(&mut summary.by_error_class, "error_class");
+                bump(&mut summary.by_account, "account");
             }
             Err(_) => summary.malformed += 1,
         }
@@ -186,12 +225,12 @@ pub(crate) fn summarize<'a, I: Iterator<Item = &'a str>>(lines: I) -> Summary {
 }
 
 /// Best-effort ancestor chain of the current process: `name(pid)` entries,
-/// nearest first, at most three levels. Empty on any failure.
+/// nearest first, at most eight levels. Empty on any failure.
 #[cfg(target_os = "macos")]
 pub(crate) fn process_chain() -> Vec<String> {
     let mut chain = Vec::new();
     let mut pid = std::os::unix::process::parent_id() as i32;
-    for _ in 0..3 {
+    for _ in 0..MAX_CHAIN {
         if pid <= 1 {
             break;
         }
@@ -264,6 +303,9 @@ mod tests {
             command: None,
             pid: 42,
             chain: vec!["zsh(41)".into(), "claude(40)".into()],
+            error_class: None,
+            account: None,
+            session: None,
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
@@ -279,10 +321,31 @@ mod tests {
             command: Some("whoami"),
             pid: 42,
             chain: Vec::new(),
+            error_class: None,
+            account: None,
+            session: None,
         };
         assert_eq!(
             serde_json::to_string(&bare).unwrap(),
             r#"{"ts":1000,"op":"passthrough","outcome":"delegated","command":"whoami","pid":42}"#
+        );
+
+        let failed = Event {
+            ts: 1000,
+            op: "read",
+            reference: Some("op://a/b/c"),
+            outcome: "error",
+            ttl_remaining: None,
+            command: None,
+            pid: 42,
+            chain: Vec::new(),
+            error_class: Some("approval-unavailable"),
+            account: Some("desktop"),
+            session: Some("s-1".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&failed).unwrap(),
+            r#"{"ts":1000,"op":"read","reference":"op://a/b/c","outcome":"error","pid":42,"error_class":"approval-unavailable","account":"desktop","session":"s-1"}"#
         );
     }
 
@@ -292,15 +355,18 @@ mod tests {
             r#"{"ts":1,"op":"read","reference":"op://a/b/c","outcome":"hit","pid":1}"#,
             r#"{"ts":2,"op":"read","reference":"op://a/b/c","outcome":"fetched","pid":1}"#,
             r#"{"ts":3,"op":"run","reference":"op://d/e/f","outcome":"hit","pid":1}"#,
+            r#"{"ts":4,"op":"run","reference":"op://d/e/f","outcome":"error","error_class":"not-found","account":"agents","pid":1}"#,
             "not json at all",
         ];
         let summary = summarize(lines.iter().copied());
-        assert_eq!(summary.total, 3);
+        assert_eq!(summary.total, 4);
         assert_eq!(summary.malformed, 1);
         assert_eq!(summary.by_outcome.get("hit"), Some(&2));
         assert_eq!(summary.by_outcome.get("fetched"), Some(&1));
         assert_eq!(summary.by_reference.get("op://a/b/c"), Some(&2));
-        assert_eq!(summary.by_reference.get("op://d/e/f"), Some(&1));
+        assert_eq!(summary.by_reference.get("op://d/e/f"), Some(&2));
+        assert_eq!(summary.by_error_class.get("not-found"), Some(&1));
+        assert_eq!(summary.by_account.get("agents"), Some(&1));
     }
 
     #[test]
@@ -309,7 +375,17 @@ mod tests {
 
         let base = std::env::temp_dir().join(format!("op-fast-audit-test-{}", std::process::id()));
         let dir = base.join("audit");
-        try_record_to(&dir, "read", Some("op://t/t/t"), "hit", Some(1), None).unwrap();
+        try_record_to(
+            &dir,
+            Entry {
+                op: "read",
+                reference: Some("op://t/t/t"),
+                outcome: "hit",
+                ttl_remaining: Some(1),
+                ..Entry::default()
+            },
+        )
+        .unwrap();
 
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
@@ -332,7 +408,15 @@ mod tests {
         std::fs::write(&occupied, b"not a directory").unwrap();
         std::fs::set_permissions(&occupied, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let result = try_record_to(&occupied, "read", Some("op://t/t/t"), "hit", None, None);
+        let result = try_record_to(
+            &occupied,
+            Entry {
+                op: "read",
+                reference: Some("op://t/t/t"),
+                outcome: "hit",
+                ..Entry::default()
+            },
+        );
         assert!(result.is_err());
 
         // The unrelated file occupying the path must be left untouched.
@@ -344,6 +428,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn process_chain_reports_at_least_the_parent() {
         // Under `cargo test` the parent is the test runner / shell.
         let chain = process_chain();
