@@ -45,23 +45,60 @@ impl ServiceAccount {
 
 /// Account names double as keyring account names and CLI arguments, so keep
 /// them to a boring character set.
+///
+/// Error messages never repeat the name: a mistyped command can put a token
+/// where a name belongs.
 pub fn validate_account_name(name: &str) -> Result<()> {
     anyhow::ensure!(
         !name.is_empty()
             && name.len() <= 64
+            && !name.starts_with("ops_")
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
-        "invalid service account name {:?}: use 1-64 characters from [A-Za-z0-9._-]",
-        name
+        "invalid service account name: use 1-64 characters from [A-Za-z0-9._-], not starting with 'ops_'"
     );
     anyhow::ensure!(
         !name.eq_ignore_ascii_case("none") && !name.eq_ignore_ascii_case("desktop"),
-        "service account name {:?} is reserved",
-        name
+        "service account names 'none' and 'desktop' are reserved"
     );
     Ok(())
 }
+
+/// A name safe to repeat in messages: the name itself when valid.
+pub fn display_account_name(name: &str) -> String {
+    if validate_account_name(name).is_ok() {
+        format!("{:?}", name)
+    } else {
+        "<invalid name, not shown>".to_string()
+    }
+}
+
+/// Parse TOML without ever echoing file content (a mistaken `token = "..."`
+/// line must not reach the terminal): message plus line number only.
+fn parse_toml(content: &str) -> Result<RawConfig> {
+    toml::from_str(content).map_err(|e| {
+        let line = e.span().map(|span| {
+            content[..span.start.min(content.len())]
+                .matches('\n')
+                .count()
+                + 1
+        });
+        let message = e
+            .message()
+            .lines()
+            .next()
+            .unwrap_or("parse error")
+            .to_string();
+        match line {
+            Some(line) => anyhow::anyhow!("{} (line {})", message, line),
+            None => anyhow::anyhow!("{}", message),
+        }
+    })
+}
+
+/// Floor for `prompt_timeout`: a zero deadline would fail every fetch.
+const MIN_PROMPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct TtlRule {
@@ -86,7 +123,8 @@ impl Config {
 
         let raw = if config_path.exists() {
             let content = fs::read_to_string(&config_path).context("Failed to read config file")?;
-            toml::from_str(&content)?
+            parse_toml(&content)
+                .with_context(|| format!("Invalid config file {}", config_path.display()))?
         } else {
             RawConfig::default()
         };
@@ -101,8 +139,9 @@ impl Config {
         }
 
         if let Ok(v) = env::var("OP_FAST_PROMPT_TIMEOUT") {
-            config.prompt_timeout =
-                humantime::parse_duration(&v).context("Invalid OP_FAST_PROMPT_TIMEOUT")?;
+            config.prompt_timeout = humantime::parse_duration(&v)
+                .context("Invalid OP_FAST_PROMPT_TIMEOUT")?
+                .max(MIN_PROMPT_TIMEOUT);
         }
 
         Ok(config)
@@ -112,14 +151,25 @@ impl Config {
     /// (bypass, doctor).
     pub fn load_or_default() -> Self {
         Self::load().unwrap_or_else(|e| {
-            log::warn!("config unavailable, using defaults: {:#}", e);
-            Self::from_raw(RawConfig::default()).expect("default config is valid")
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "op-fast: warning: ignoring config ({:#}); using defaults",
+                    e
+                )
+            });
+            Self::defaults()
         })
+    }
+
+    /// Built-in defaults, ignoring the config file and environment.
+    pub fn defaults() -> Self {
+        Self::from_raw(RawConfig::default()).expect("default config is valid")
     }
 
     #[cfg(test)]
     pub fn load_from_str(src: &str) -> Result<Self> {
-        Self::from_raw(toml::from_str(src)?)
+        Self::from_raw(parse_toml(src)?)
     }
 
     /// TTL for a reference fetched through `account` (or desktop auth).
@@ -163,7 +213,8 @@ impl Config {
                 .with_context(|| format!("Invalid {}", what))
                 .map(|d| d.unwrap_or(default))
         };
-        let prompt_timeout = parse(raw.prompt_timeout, "prompt_timeout", DEFAULT_PROMPT_TIMEOUT)?;
+        let prompt_timeout = parse(raw.prompt_timeout, "prompt_timeout", DEFAULT_PROMPT_TIMEOUT)?
+            .max(MIN_PROMPT_TIMEOUT);
         let stale_grace = parse(raw.stale_grace, "stale_grace", DEFAULT_STALE_GRACE)?;
 
         let mut service_accounts: Vec<ServiceAccount> = Vec::new();
@@ -247,7 +298,7 @@ mod tests {
     use super::*;
 
     fn parse(toml_src: &str) -> Result<Config> {
-        Config::from_raw(toml::from_str(toml_src)?)
+        Config::from_raw(parse_toml(toml_src)?)
     }
 
     #[test]
@@ -296,9 +347,39 @@ vaults = ["CI"]
     }
 
     #[test]
-    fn rejects_a_token_key_in_config() {
+    fn rejects_a_token_key_in_config_without_echoing_it() {
         // Tokens live only in the OS keyring.
-        assert!(parse("[[service_account]]\nname = \"a\"\ntoken = \"x\"\n").is_err());
+        let err = parse("[[service_account]]\nname = \"a\"\ntoken = \"FAKE-SECRET-VALUE\"\n")
+            .unwrap_err();
+        let text = format!("{:#}", err);
+        assert!(text.contains("token"), "{}", text);
+        assert!(text.contains("line 3"), "{}", text);
+        assert!(!text.contains("FAKE-SECRET-VALUE"), "{}", text);
+        // A syntax error on that line must not echo it either.
+        let err = parse("token = \"FAKE-SECRET-VALUE\n").unwrap_err();
+        assert!(!format!("{:#}", err).contains("FAKE-SECRET-VALUE"));
+    }
+
+    #[test]
+    fn invalid_names_are_never_echoed() {
+        let long = "x".repeat(65);
+        for name in [long.as_str(), "ops_FAKE0000", "a b"] {
+            let err = validate_account_name(name).unwrap_err().to_string();
+            assert!(!err.contains(name), "{}", err);
+            assert_eq!(display_account_name(name), "<invalid name, not shown>");
+        }
+    }
+
+    #[test]
+    fn prompt_timeout_is_floored_at_one_second() {
+        assert_eq!(
+            parse("prompt_timeout = \"0s\"").unwrap().prompt_timeout,
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            parse("prompt_timeout = \"5s\"").unwrap().prompt_timeout,
+            Duration::from_secs(5)
+        );
     }
 
     #[test]

@@ -43,6 +43,18 @@ pub fn init() -> anyhow::Result<()> {
     }
 }
 
+/// Debug builds only: `OP_FAST_TEST_FORCE_GC=1` makes GC deterministic for
+/// tests. Release builds compile this to `false`.
+fn gc_forced_for_tests() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os("OP_FAST_TEST_FORCE_GC").is_some_and(|v| v == "1") {
+            return true;
+        }
+    }
+    false
+}
+
 pub struct Store {
     db: Db,
 }
@@ -58,7 +70,7 @@ impl Store {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        if now.is_multiple_of(10)
+        if (now.is_multiple_of(10) || gc_forced_for_tests())
             && let Err(e) = store.db.gc(stale_grace)
         {
             log::warn!("Background GC failed: {}", e);

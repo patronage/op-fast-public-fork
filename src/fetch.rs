@@ -75,6 +75,10 @@ impl<'a> Fetcher<'a> {
     }
 
     fn call_auth(&self, auth: &Auth) -> Result<CallAuth> {
+        if matches!(auth, Auth::Account(_)) {
+            // Check before reading the token from the keyring at all.
+            self.delegate.verify_for_token()?;
+        }
         let token = account::token_for(auth)?;
         Ok(CallAuth::new(auth.clone(), token, self.config))
     }
@@ -127,7 +131,7 @@ impl<'a> Fetcher<'a> {
             }
         }
 
-        let no_stale = std::env::var(NO_STALE_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
+        let no_stale = crate::command::is_truthy(std::env::var_os(NO_STALE_ENV).as_deref());
         let mut stale: Vec<(String, String, u64, Auth)> = Vec::new();
         let mut needs: Vec<String> = Vec::new();
 

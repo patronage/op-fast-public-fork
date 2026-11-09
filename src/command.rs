@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use anyhow::Result;
 use clap::Parser;
 
-use crate::account::{self, Selector};
+use crate::account::{self, Auth, Selector};
 use crate::audit::Entry;
 use crate::config::Config;
 use crate::delegate::OpDelegate;
@@ -84,34 +84,68 @@ pub fn execute(subcommand: Subcommand, sa: Option<&str>) -> Result<()> {
         Subcommand::Sa(cmd) => sa::execute(cmd),
         Subcommand::Store(cmd) => store::execute(cmd),
         Subcommand::Audit(cmd) => audit::execute(cmd),
-        Subcommand::Other(args) => passthrough(&args, sa, "delegated"),
+        Subcommand::Other(args) => {
+            // clap hands external subcommands everything, including our own
+            // flags; strip them wherever they appear before `--`.
+            let mut with_argv0 = vec![OsString::from("op-fast")];
+            with_argv0.extend(args);
+            let (rest, inner_sa) = strip_own_flags(&with_argv0, true);
+            passthrough(&rest, inner_sa.as_deref().or(sa), "delegated")
+        }
     }
 }
 
-/// The first token naming a command op-fast knows about (own or
-/// accelerated), skipping flags and our own `--sa <name>`.
-pub fn known_command(args: &[OsString]) -> Option<String> {
+/// `op` flags that take a value, so the value is not mistaken for a
+/// subcommand when looking for positionals.
+const VALUE_FLAGS: &[&str] = &[
+    "--sa",
+    "--account",
+    "--config",
+    "--encoding",
+    "--format",
+    "--session",
+    "--vault",
+    "--environment",
+    "--env-file",
+    "--out-file",
+    "-o",
+    "--in-file",
+    "-i",
+    "--file-mode",
+];
+
+/// Positional words before `--` (argv[0] excluded), skipping flags and the
+/// values of known value-taking flags.
+pub fn positionals(args: &[OsString]) -> Vec<String> {
+    let mut out = Vec::new();
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
         let s = arg.to_string_lossy();
         if s == "--" {
-            return None;
+            break;
         }
-        if s == "--sa" {
-            iter.next();
+        if s.starts_with('-') {
+            if VALUE_FLAGS.contains(&s.as_ref()) {
+                iter.next();
+            }
             continue;
         }
-        if OWN_COMMANDS.contains(&s.as_ref()) || ACCELERATED_COMMANDS.contains(&s.as_ref()) {
-            return Some(s.into_owned());
-        }
+        out.push(s.into_owned());
     }
-    None
+    out
 }
 
-/// Remove op-fast's own flags (`--sa <name>`, `--sa=<name>`, `--refresh`)
-/// from an invocation bound for the real `op`, stopping at `--`. Returns the
-/// cleaned args (without argv[0]) and the `--sa` value.
-pub fn strip_own_flags(args: &[OsString]) -> (Vec<OsString>, Option<String>) {
+/// The subcommand, if op-fast knows it (own or accelerated).
+pub fn known_command(args: &[OsString]) -> Option<String> {
+    positionals(args).into_iter().next().filter(|s| {
+        OWN_COMMANDS.contains(&s.as_str()) || ACCELERATED_COMMANDS.contains(&s.as_str())
+    })
+}
+
+/// Remove op-fast's own flags (`--sa <name>`, `--sa=<name>`, and with
+/// `refresh` also `--refresh`) wherever they appear before `--`. Returns
+/// the cleaned args (without argv[0]) and the `--sa` value.
+pub fn strip_own_flags(args: &[OsString], refresh: bool) -> (Vec<OsString>, Option<String>) {
     let mut out = Vec::new();
     let mut sa = None;
     let mut iter = args.iter().skip(1);
@@ -129,7 +163,7 @@ pub fn strip_own_flags(args: &[OsString]) -> (Vec<OsString>, Option<String>) {
             sa = iter.next().map(|v| v.to_string_lossy().into_owned());
         } else if let Some(v) = s.strip_prefix("--sa=") {
             sa = Some(v.to_string());
-        } else if s == "--refresh" {
+        } else if refresh && s == "--refresh" {
             // `op` always reads fresh; the flag only matters to the cache.
         } else {
             out.push(arg.clone());
@@ -158,19 +192,76 @@ fn flag_value<'a>(args: &'a [OsString], name: &str) -> Option<&'a str> {
     None
 }
 
+/// Passthrough subcommands that may receive a service-account token: they
+/// only talk to 1Password and never execute a caller-supplied program.
+/// `args` excludes argv[0].
+pub fn token_allowed(args: &[OsString]) -> bool {
+    let mut with_argv0 = vec![OsString::from("op")];
+    with_argv0.extend(args.iter().cloned());
+    let words = positionals(&with_argv0);
+    let first = words.first().map(String::as_str);
+    let second = words.get(1).map(String::as_str);
+    match (first, second) {
+        (Some("read" | "inject" | "whoami"), _) => true,
+        (Some("item"), Some("get" | "list" | "create" | "edit" | "delete" | "template")) => true,
+        (Some("vault"), Some("get" | "list")) => true,
+        (Some("document"), Some("get")) => true,
+        (Some("user"), Some("get")) => args.iter().take_while(|a| *a != "--").any(|a| a == "--me"),
+        _ => false,
+    }
+}
+
 /// Send an invocation to the real `op` unchanged (inherited stdio, no
-/// deadline: `op run` may legitimately run for hours). Account selection
-/// follows `--sa`/`OP_FAST_ACCOUNT`, then `--vault`, then desktop auth.
+/// deadline: `op run` may legitimately run for hours). Account selection:
+/// the account covering `--vault`, then `--sa`/`OP_FAST_ACCOUNT`, then
+/// desktop auth. A token is only handed to allowlisted, non-executing
+/// subcommands, and only to a 1Password-signed `op`.
 pub fn passthrough(args: &[OsString], sa: Option<&str>, outcome: &'static str) -> Result<()> {
-    let config = Config::load()?;
+    let config = Config::load_or_default();
     let selector = Selector::new(&config, sa)?;
-    let auth = selector.for_vault(flag_value(args, "vault"));
-    let token = account::token_for(&auth)?;
+    let mut auth = selector.for_vault(flag_value(args, "vault"));
 
     let subcommand = args
         .first()
         .map(|arg| arg.to_string_lossy().into_owned())
         .unwrap_or_default();
+
+    if let Auth::Account(name) = &auth
+        && !token_allowed(args)
+    {
+        let first = positionals(
+            &[OsString::from("op")]
+                .into_iter()
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+        if first == "run" {
+            anyhow::bail!(
+                "refusing to pass service account {:?} to `op run`: the token would reach the child process. \
+                 Drop the flags op-fast does not model so `op-fast run` resolves the references itself, \
+                 or pass `--sa none` with no `--vault`",
+                name
+            );
+        }
+        eprintln!(
+            "note: service account {:?} is not used for `op {}`; passing through with desktop auth",
+            name, first
+        );
+        auth = Auth::Desktop;
+    }
+
+    let delegate = OpDelegate::new(&config)?;
+    let token = match &auth {
+        Auth::Account(_) => {
+            delegate.verify_for_token()?;
+            account::token_for(&auth)?
+        }
+        _ => None,
+    };
+
     let reference = args
         .iter()
         .filter_map(|a| a.to_str())
@@ -184,33 +275,57 @@ pub fn passthrough(args: &[OsString], sa: Option<&str>, outcome: &'static str) -
         ..Entry::default()
     });
 
-    let delegate = OpDelegate::new(&config)?;
-    let mut cmd = delegate.command();
+    let mut cmd = delegate.command_with_token(token.as_deref())?;
     cmd.args(args);
-    if let Some(token) = &token {
-        cmd.env(account::TOKEN_ENV, token);
-    }
     let status = cmd.status()?;
     Err(ExitCode(status.code().unwrap_or(1)).into())
 }
 
-/// `OP_FAST_BYPASS=1`: every invocation goes straight to the real `op`.
-pub fn bypass(args: &[OsString]) -> Result<()> {
+/// Hand an invocation (without argv[0]) to the real `op` with no token and
+/// no account selection.
+pub fn raw_delegate(args: &[OsString], outcome: &'static str) -> Result<()> {
     let config = Config::load_or_default();
-    let rest: Vec<OsString> = args.iter().skip(1).cloned().collect();
-    let subcommand = rest
+    let subcommand = args
         .first()
         .map(|a| a.to_string_lossy().into_owned())
         .unwrap_or_default();
     crate::audit::log(Entry {
         op: "passthrough",
-        outcome: "bypass",
+        outcome,
         command: Some(&subcommand),
         ..Entry::default()
     });
     let delegate = OpDelegate::new(&config)?;
-    let status = delegate.command().args(&rest).status()?;
+    let status = delegate.command().args(args).status()?;
     Err(ExitCode(status.code().unwrap_or(1)).into())
+}
+
+/// `OP_FAST_BYPASS=1`: everything except op-fast-only commands goes
+/// straight to the real `op`, with `--sa` stripped.
+pub fn bypass(args: &[OsString]) -> Result<()> {
+    let (rest, _) = strip_own_flags(args, false);
+    raw_delegate(&rest, "bypass")
+}
+
+/// Whether this invocation is an op-fast-only command.
+pub fn is_own_command(args: &[OsString]) -> bool {
+    known_command(args).is_some_and(|c| OWN_COMMANDS.contains(&c.as_str()))
+}
+
+/// When invoked as `op`, these go to the real `op` so callers see its
+/// version and help, not op-fast's.
+pub fn is_op_meta_invocation(args: &[OsString]) -> bool {
+    let invoked_as_op = args
+        .first()
+        .and_then(|a| std::path::Path::new(a).file_name())
+        .is_some_and(|n| n == "op");
+    if !invoked_as_op {
+        return false;
+    }
+    match args.get(1).and_then(|a| a.to_str()) {
+        None => args.len() == 1,
+        Some(a) => matches!(a, "--version" | "-v" | "--help" | "-h" | "help"),
+    }
 }
 
 pub fn is_truthy(v: Option<&OsStr>) -> bool {
@@ -227,20 +342,23 @@ mod tests {
 
     #[test]
     fn strip_removes_only_our_flags_before_dashdash() {
-        let (out, sa) = strip_own_flags(&os(&[
-            "op",
-            "run",
-            "--sa",
-            "agents",
-            "--refresh",
-            "--environment",
-            "x",
-            "--",
-            "cmd",
-            "--refresh",
-            "--sa",
-            "y",
-        ]));
+        let (out, sa) = strip_own_flags(
+            &os(&[
+                "op",
+                "run",
+                "--sa",
+                "agents",
+                "--refresh",
+                "--environment",
+                "x",
+                "--",
+                "cmd",
+                "--refresh",
+                "--sa",
+                "y",
+            ]),
+            true,
+        );
         assert_eq!(
             out,
             os(&[
@@ -256,20 +374,22 @@ mod tests {
         );
         assert_eq!(sa.as_deref(), Some("agents"));
 
-        let (out, sa) = strip_own_flags(&os(&[
-            "op",
-            "--sa=none",
-            "read",
-            "--account",
-            "x",
-            "op://a/b/c",
-        ]));
+        let (out, sa) = strip_own_flags(
+            &os(&["op", "--sa=none", "read", "--account", "x", "op://a/b/c"]),
+            true,
+        );
         assert_eq!(out, os(&["read", "--account", "x", "op://a/b/c"]));
         assert_eq!(sa.as_deref(), Some("none"));
+
+        let (out, _) = strip_own_flags(
+            &os(&["op", "item", "list", "--sa", "a", "--refresh"]),
+            false,
+        );
+        assert_eq!(out, os(&["item", "list", "--refresh"]));
     }
 
     #[test]
-    fn known_command_finds_first_known_token() {
+    fn known_command_is_the_first_positional() {
         assert_eq!(
             known_command(&os(&["op", "--account", "x", "read", "r"])),
             Some("read".into())
@@ -282,7 +402,52 @@ mod tests {
             known_command(&os(&["op", "store", "list", "--bogus"])),
             Some("store".into())
         );
+        assert_eq!(known_command(&os(&["op", "item", "get", "store"])), None);
         assert_eq!(known_command(&os(&["op", "item", "list"])), None);
+    }
+
+    #[test]
+    fn token_allowlist() {
+        let ok = |v: &[&str]| token_allowed(&os(v));
+        assert!(ok(&["read", "--account", "x", "op://a/b/c"]));
+        assert!(ok(&["inject", "-i", "x"]));
+        assert!(ok(&["whoami"]));
+        assert!(ok(&["item", "get", "x", "--vault", "V"]));
+        assert!(ok(&["item", "list", "--vault", "V"]));
+        assert!(ok(&["vault", "list"]));
+        assert!(ok(&["document", "get", "x"]));
+        assert!(ok(&["user", "get", "--me"]));
+        assert!(!ok(&["user", "get", "someone"]));
+        assert!(!ok(&["run", "--environment", "x", "--", "printenv"]));
+        assert!(!ok(&["--account", "x", "run", "--", "sh"]));
+        for cmd in [
+            "plugin",
+            "signin",
+            "signout",
+            "account",
+            "service-account",
+            "connect",
+            "completion",
+            "events-api",
+        ] {
+            assert!(!ok(&[cmd, "list"]), "{}", cmd);
+        }
+        assert!(!ok(&["vault", "create", "x"]));
+        assert!(!ok(&["document", "create", "x"]));
+    }
+
+    #[test]
+    fn op_meta_invocations() {
+        assert!(is_op_meta_invocation(&os(&[
+            "/usr/local/bin/op",
+            "--version"
+        ])));
+        assert!(is_op_meta_invocation(&os(&["op", "-h"])));
+        assert!(is_op_meta_invocation(&os(&["op", "help"])));
+        assert!(is_op_meta_invocation(&os(&["op"])));
+        assert!(!is_op_meta_invocation(&os(&["op", "read", "x"])));
+        assert!(!is_op_meta_invocation(&os(&["op-fast", "--version"])));
+        assert!(!is_op_meta_invocation(&os(&["op-fast"])));
     }
 
     #[test]

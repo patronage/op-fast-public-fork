@@ -23,6 +23,16 @@ Makes op-fast safe to install as the machine-wide `op`.
 - Audit events gain `error_class`, `account`, `session`, and an 8-level process
   chain. New outcomes `refreshed` and `stale-served`.
 - `run` no longer treats unknown flags before `--` as part of the command.
+- Hardening before use as the default `op`: service-account tokens only go to
+  a 1Password-signed delegate and to non-executing passthrough subcommands;
+  the PATH search ignores relative entries; configured delegate paths must be
+  absolute; approval-unavailable needs an anchored message and a desktop call;
+  invoked as `op`, version/help go to the real `op`; deadline kills take the
+  process group; `prompt_timeout` has a 1 s floor; passthrough survives a
+  broken config; doctor checks token presence without reading tokens.
+- Fixes: `read`/`run` expand `$VAR` before caching; masked `run` output is
+  byte-exact and fully drained; `run` leaves argv untouched; a reference no
+  longer swallows a following `op://` or `NAME=` across whitespace.
 
 # Unreleased
 

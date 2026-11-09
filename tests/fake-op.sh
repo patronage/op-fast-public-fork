@@ -12,6 +12,10 @@
 #   FAKE_OP_FAIL_DESKTOP_ONLY  only fail when no token is set
 #   FAKE_OP_SLEEP   sleep this many seconds before answering
 #   FAKE_OP_ITEM_JSON  file printed for `item get`
+#   FAKE_OP_GRANDCHILD  background a `sleep` and write its PID to this file
+#                       before sleeping (process-group kill test)
+#
+# `run ... -- cmd args` execs cmd, like the real `op run` would.
 
 code="${FAKE_OP_EXIT:-1}"
 
@@ -39,6 +43,13 @@ fi
 
 if [ "${1:-}" = "--version" ]; then
   echo "2.99.0-fake"
+  exit 0
+fi
+
+if [ -n "${FAKE_OP_GRANDCHILD:-}" ]; then
+  sleep 30 &
+  echo $! > "$FAKE_OP_GRANDCHILD"
+  sleep 30
   exit 0
 fi
 
@@ -85,6 +96,11 @@ case "${1:-}" in
 $template
 TEMPLATE
     printf '%s' "$out"
+    ;;
+  run)
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
+    [ $# -gt 0 ] && shift
+    exec "$@"
     ;;
   item)
     if [ "${2:-}" = "get" ] && [ -n "${FAKE_OP_ITEM_JSON:-}" ]; then

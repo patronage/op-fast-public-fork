@@ -70,6 +70,39 @@ pub fn delete(service: &str, account: &str) -> Result<bool> {
     }
 }
 
+/// Whether an entry exists, without reading its value (so no Keychain
+/// access dialog). `None` when the backend has no attribute-only lookup.
+pub fn exists(service: &str, account: &str) -> Option<bool> {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = test_dir() {
+        return Some(test_backend::exists(&dir, service, account));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Without -g/-w, `security` returns attributes only, never the
+        // secret, so it cannot raise an access dialog.
+        let status = std::process::Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-s", service, "-a", account])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        match status.code() {
+            Some(0) => Some(true),
+            Some(44) => Some(false),
+            _ => None,
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (service, account);
+        None
+    }
+}
+
 /// Human-readable backend name, for `doctor`.
 pub fn backend_name() -> &'static str {
     #[cfg(debug_assertions)]
@@ -127,6 +160,10 @@ mod test_backend {
             .open(&p)?;
         f.write_all(value.as_bytes())?;
         Ok(())
+    }
+
+    pub fn exists(dir: &Path, service: &str, account: &str) -> bool {
+        path(dir, service, account).is_file()
     }
 
     pub fn delete(dir: &Path, service: &str, account: &str) -> Result<bool> {

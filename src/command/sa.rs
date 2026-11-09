@@ -64,7 +64,8 @@ struct Row {
     name: String,
     vaults: Vec<String>,
     ttl: Option<String>,
-    token: bool,
+    /// `null` when the keyring offers no attribute-only lookup.
+    token: Option<bool>,
     configured: bool,
 }
 
@@ -115,7 +116,7 @@ pub fn execute(cmd: SaCommand) -> Result<()> {
                     name: a.name.clone(),
                     vaults: a.vaults.clone(),
                     ttl: a.ttl.map(|d| humantime::format_duration(d).to_string()),
-                    token: account::has_token(&a.name),
+                    token: account::token_present(&a.name),
                     configured: true,
                 })
                 .collect();
@@ -132,7 +133,11 @@ pub fn execute(cmd: SaCommand) -> Result<()> {
                     println!(
                         "{:<20} {:<8} {:<10} {}",
                         r.name,
-                        if r.token { "present" } else { "missing" },
+                        match r.token {
+                            Some(true) => "present",
+                            Some(false) => "missing",
+                            None => "unknown",
+                        },
                         r.ttl.as_deref().unwrap_or("default"),
                         r.vaults.join(", ")
                     );
@@ -162,7 +167,24 @@ pub fn execute(cmd: SaCommand) -> Result<()> {
     Ok(())
 }
 
-/// Read one line from the terminal with echo off.
+/// Terminal settings to restore if SIGINT/SIGTERM arrives while echo is
+/// off. Written once before echo is disabled; read only by the handler.
+static mut SAVED_TERMIOS: Option<libc::termios> = None;
+
+extern "C" fn restore_echo_and_exit(sig: libc::c_int) {
+    // Async-signal-safe: tcsetattr, write, and _exit only.
+    unsafe {
+        if let Some(t) = (*std::ptr::addr_of!(SAVED_TERMIOS)).as_ref() {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t);
+        }
+        let nl = b"\n";
+        libc::write(libc::STDERR_FILENO, nl.as_ptr() as *const libc::c_void, 1);
+        libc::_exit(128 + sig);
+    }
+}
+
+/// Read one line from the terminal with echo off. Echo is restored on
+/// return, on error, and on SIGINT/SIGTERM.
 fn read_hidden(prompt: &str) -> Result<String> {
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
@@ -177,6 +199,14 @@ fn read_hidden(prompt: &str) -> Result<String> {
         bail!("could not read terminal settings");
     }
     let original = term;
+    let handler = restore_echo_and_exit as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    let (old_int, old_term) = unsafe {
+        *std::ptr::addr_of_mut!(SAVED_TERMIOS) = Some(original);
+        (
+            libc::signal(libc::SIGINT, handler),
+            libc::signal(libc::SIGTERM, handler),
+        )
+    };
     term.c_lflag &= !libc::ECHO;
     term.c_lflag |= libc::ECHONL;
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
@@ -184,7 +214,11 @@ fn read_hidden(prompt: &str) -> Result<String> {
     }
     let mut line = String::new();
     let result = stdin.read_line(&mut line).context("failed to read token");
-    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+    unsafe {
+        libc::tcsetattr(fd, libc::TCSANOW, &original);
+        libc::signal(libc::SIGINT, old_int);
+        libc::signal(libc::SIGTERM, old_term);
+    }
     result?;
     Ok(line)
 }

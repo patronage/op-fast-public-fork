@@ -12,7 +12,11 @@ use crate::error::{DelegateError, ErrorClass, NeedsApproval};
 #[clap(
     about = "Print an ID-based secret reference for an item (no values)",
     long_about = "Look up an item with `op item get --format json` and print a stable,
-ID-based reference: op://<vault-id>/<item-id>/<field-id>.
+reference: op://<vault>/<item-id>/<field-id>.
+
+The vault segment is the vault name, so a [[service_account]] that lists the
+vault by name still selects it. When an account lists the vault by ID, or
+with --ids, the vault ID is used instead.
 
 Use it when an item or field name has spaces, slashes, or other characters
 that break name-based references. Without a field, prints one reference per
@@ -31,6 +35,9 @@ pub struct RefArgs {
 
     #[clap(long, help = "Vault name or ID")]
     pub vault: Option<String>,
+
+    #[clap(long, help = "Use the vault ID (not its name) in the reference")]
+    pub ids: bool,
 }
 
 pub fn execute(args: RefArgs, sa: Option<&str>) -> Result<()> {
@@ -71,23 +78,36 @@ pub fn execute(args: RefArgs, sa: Option<&str>) -> Result<()> {
         ..Entry::default()
     });
 
-    for line in references(&item, args.field.as_deref())? {
+    let segment = vault_segment(&item, &config, args.ids)?;
+    for line in references(&item, &segment, args.field.as_deref())? {
         println!("{}", line);
     }
     Ok(())
 }
 
+/// Vault segment for printed references: the ID with `--ids` or when a
+/// configured account lists the vault by ID; otherwise the vault name, as
+/// accounts usually list it.
+pub fn vault_segment(item: &Value, config: &Config, ids: bool) -> Result<String> {
+    let id = item
+        .pointer("/vault/id")
+        .and_then(Value::as_str)
+        .context("item JSON has no vault.id")?;
+    let name = item.pointer("/vault/name").and_then(Value::as_str);
+    let listed_by_id = config.service_accounts.iter().any(|a| a.covers_vault(id));
+    Ok(match name {
+        Some(name) if !ids && !listed_by_id && !name.contains('/') => name.to_string(),
+        _ => id.to_string(),
+    })
+}
+
 /// Build reference lines from `op item get --format json` output. Reads
 /// only ids and labels; values are never touched.
-pub fn references(item: &Value, field: Option<&str>) -> Result<Vec<String>> {
+pub fn references(item: &Value, vault_id: &str, field: Option<&str>) -> Result<Vec<String>> {
     let item_id = item
         .get("id")
         .and_then(Value::as_str)
         .context("item JSON has no id")?;
-    let vault_id = item
-        .pointer("/vault/id")
-        .and_then(Value::as_str)
-        .context("item JSON has no vault.id")?;
     let fields: Vec<(&str, &str)> = item
         .get("fields")
         .and_then(Value::as_array)
@@ -166,19 +186,32 @@ mod tests {
     #[test]
     fn builds_id_reference_by_label_or_id() {
         assert_eq!(
-            references(&item(), Some("Secret Key")).unwrap(),
+            references(&item(), "vlt456", Some("Secret Key")).unwrap(),
             vec!["op://vlt456/itm123/abc9"]
         );
         assert_eq!(
-            references(&item(), Some("abc9")).unwrap(),
+            references(&item(), "vlt456", Some("abc9")).unwrap(),
             vec!["op://vlt456/itm123/abc9"]
         );
-        assert!(references(&item(), Some("nope")).is_err());
+        assert!(references(&item(), "vlt456", Some("nope")).is_err());
+    }
+
+    #[test]
+    fn vault_segment_prefers_name_unless_ids_or_listed_by_id() {
+        let mut c = Config::load_from_str("").unwrap();
+        assert_eq!(vault_segment(&item(), &c, false).unwrap(), "Agents");
+        assert_eq!(vault_segment(&item(), &c, true).unwrap(), "vlt456");
+        c.service_accounts.push(crate::config::ServiceAccount {
+            name: "agents".into(),
+            vaults: vec!["vlt456".into()],
+            ttl: None,
+        });
+        assert_eq!(vault_segment(&item(), &c, false).unwrap(), "vlt456");
     }
 
     #[test]
     fn listing_never_includes_values() {
-        let lines = references(&item(), None).unwrap();
+        let lines = references(&item(), "vlt456", None).unwrap();
         assert_eq!(lines.len(), 3);
         assert!(lines.iter().all(|l| !l.contains("SHOULD-NOT-PRINT")));
     }

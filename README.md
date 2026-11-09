@@ -124,6 +124,14 @@ DB_PASSWORD='op://app-prod/db/password' op-fast run --no-masking -- printenv DB_
 op-fast run --refresh --env-file .env -- ./deploy.sh
 ```
 
+`run` expands `$VAR` in each environment value that contains a reference,
+then resolves the references; the cache key is the expanded reference. The
+command's arguments are passed through untouched: op-fast never expands
+variables or substitutes references inside argv, so secrets reach the child
+only through its environment (as with `op run`). Masked output is copied as
+raw bytes, so non-UTF-8 output survives, and op-fast drains it completely
+before exiting.
+
 `inject` also accepts `--refresh`.
 
 ### refresh and warm
@@ -160,8 +168,10 @@ op-fast status 'op://app-prod/db/password' [--json]
 # `op --version`. Use this instead of `op whoami` as a pre-check.
 op-fast doctor [--json]
 
-# Stable ID-based reference for an item with an awkward name. Prints no values.
+# Stable reference for an item with an awkward name. Prints no values.
 op-fast ref 'Stripe (live)' 'secret key' --vault Agents
+# => op://Agents/<item-id>/<field-id>
+op-fast ref 'Stripe (live)' 'secret key' --vault Agents --ids
 # => op://<vault-id>/<item-id>/<field-id>
 
 # One screen of guidance for AI agents and scripts
@@ -187,18 +197,39 @@ op-fast sa remove agents
 ```
 
 - A reference uses the first account whose `vaults` contains its vault
-  segment. `--sa <name>` or `OP_FAST_ACCOUNT=<name>` forces an account;
-  `--sa none` forces desktop auth.
-- Passthrough commands use the forced account, else the account covering
-  `--vault <v>`, else desktop auth.
-- op-fast sets `OP_SERVICE_ACCOUNT_TOKEN` on that one `op` child only. The
-  process started by `op-fast run` never sees it.
+  segment (name or ID; names match case-insensitively). `--sa <name>` or
+  `OP_FAST_ACCOUNT=<name>` forces an account; `--sa none` forces desktop
+  auth. An unknown name is an error, never a silent downgrade.
+- `op-fast ref` prints the vault *name* in the reference so a name-based
+  `vaults` entry keeps matching. It prints the vault ID with `--ids`, or
+  when an account lists that vault by ID.
+- Passthrough commands use the account covering `--vault <v>`, else the
+  forced account, else desktop auth.
+- op-fast sets `OP_SERVICE_ACCOUNT_TOKEN` on that one `op` child only, and
+  only after the delegate passes a code-signature check (macOS:
+  `codesign --verify` with requirement
+  `anchor apple generic and certificate leaf[subject.OU] = "2BUA8C4S2C"`,
+  i.e. signed by AgileBits/1Password). An unsigned or differently signed
+  delegate is refused by path. On other platforms service-account tokens
+  are refused for now.
+- Passthrough hands a token only to subcommands that never execute a
+  caller-supplied program: `read`, `inject`, `item get|list|create|edit|delete|template`,
+  `vault get|list`, `document get`, `whoami`, `user get --me`. Any other
+  passthrough runs with desktop auth (with a note on stderr), and a
+  passthrough `op run` under a selected account is refused. The process
+  started by `op-fast run` never sees the token.
 - If your environment already has `OP_SERVICE_ACCOUNT_TOKEN`, op-fast leaves
   it alone and selects no account.
 - `run`, `inject`, and `warm` make one delegate call per account group.
 - Tokens live only in the OS keyring (service `op-fast-service-account`):
   never in the config file, on argv, in the audit log, or in error text. A
-  `token` key in the config file is rejected.
+  `token` key in the config file is rejected, and the error names only the
+  key and line, never its value. Names that fail validation (for example a
+  pasted `ops_...` token) are never echoed.
+- `sa list` and `doctor` check token presence without reading the token
+  (macOS: an attribute-only `security find-generic-password` lookup, which
+  cannot raise a Keychain dialog). Where no such lookup exists they report
+  `unknown`.
 - With no `[[service_account]]` configured, behavior is unchanged.
 
 The command is `sa`, not `account`, because `op account` and
@@ -236,14 +267,25 @@ invocation to the real `op` unchanged, minus op-fast's own `--sa` and
 `--refresh`. Passthrough calls inherit stdio and get no deadline (`op run`
 may run a long-lived process).
 
-`OP_FAST_BYPASS=1` sends every invocation straight to the real `op`.
+Passthrough never fails on a config mistake: with an unreadable config it
+warns once on stderr and delegates with desktop auth. An unknown `--sa` or
+`OP_FAST_ACCOUNT` is still an error.
+
+`OP_FAST_BYPASS=1` sends every invocation straight to the real `op` with
+`--sa` stripped and no token, except op-fast-only commands (`doctor`,
+`agent-help`, `sa`, `status`, `store`, `audit`, `warm`, `refresh`, `ref`),
+which still run locally.
 
 ### Installing as `op`
 
 op-fast can be the machine-wide `op`. When it looks for the real `op` on
-`PATH`, it skips any candidate that resolves to its own executable and takes
-the next one, so a symlink or copy named `op` earlier on `PATH` works with no
-configuration:
+`PATH`, it considers only absolute `PATH` entries (empty entries and `.` are
+ignored, so a repository-local `./op` can never become the delegate), and it
+skips any candidate that resolves to its own executable. A symlink or copy
+named `op` earlier on `PATH` therefore works with no configuration. When
+invoked as `op`, `--version`, `-v`, `--help`, `-h`, `help`, and a bare `op`
+go to the real `op`, so callers see its version and help;
+`op-fast --version` still reports op-fast:
 
 ```bash
 ln -s "$(command -v op-fast)" ~/.local/bin/op   # ~/.local/bin before the real op on PATH
@@ -251,7 +293,8 @@ op doctor                                       # check which delegate it found
 ```
 
 To pin the real binary instead, set `op_command` in the config file or
-`OP_FAST_COMMAND` (which wins). As a shell-only alternative:
+`OP_FAST_COMMAND` (which wins). Both must be absolute paths. As a
+shell-only alternative:
 
 ```bash
 alias op=op-fast
@@ -266,20 +309,20 @@ Configuration file: `~/.config/op-fast/config.toml`
 default_ttl = "1day"
 
 # Deadline for op calls that may wait on a desktop approval when stderr is
-# not a TTY (default: 15s). With a TTY the deadline is 60s.
+# not a TTY (default: 15s, minimum 1s). With a TTY the deadline is 60s.
 prompt_timeout = "15s"
 
 # How long expired entries are kept and may be served when approval is
 # unavailable (default: 30days)
 stale_grace = "30days"
 
-# Path to the real op (OP_FAST_COMMAND wins; default: first op on PATH that
-# is not op-fast itself)
+# Absolute path to the real op (OP_FAST_COMMAND wins; default: first op in an
+# absolute PATH entry that is not op-fast itself)
 op_command = "/opt/homebrew/bin/op"
 
 [[service_account]]
 name = "agents"
-vaults = ["Agents"]
+vaults = ["Agents", "abcd1234vaultid"]   # names or IDs
 ttl = "15m"
 
 # Per-secret TTL patterns (glob syntax)
@@ -296,31 +339,49 @@ ttl = "15m"
 | `OP_FAST_CONFIG` | Custom config file path |
 | `OP_FAST_STORE_DIR` | Custom cache directory (the audit log lives under it) |
 | `OP_FAST_DEFAULT_TTL` | Override default TTL (e.g., `12h`, `1day`) |
-| `OP_FAST_PROMPT_TIMEOUT` | Override `prompt_timeout` |
-| `OP_FAST_COMMAND` | Path to the real `op` (wins over `op_command`) |
+| `OP_FAST_PROMPT_TIMEOUT` | Override `prompt_timeout` (minimum 1s) |
+| `OP_FAST_COMMAND` | Absolute path to the real `op` (wins over `op_command`) |
 | `OP_FAST_ACCOUNT` | Force a service account (`none` = desktop auth); `--sa` wins |
-| `OP_FAST_NO_STALE` | `1` disables stale-on-auth-failure |
-| `OP_FAST_BYPASS` | `1` sends every invocation straight to the real `op` |
+| `OP_FAST_NO_STALE` | Truthy (`1`, `true`, anything but empty/`0`/`false`) disables stale-on-auth-failure |
+| `OP_FAST_BYPASS` | Truthy: send everything but op-fast-only commands straight to the real `op` |
 | `OP_FAST_KEYRING_SERVICE` | Rename the keyring service (default `op-fast`; tokens use `<name>-service-account`) |
 
 ### Fail fast and stale on auth failure
 
 Any `op` call that may need a desktop approval gets a deadline: 60 s when
 stderr is a TTY, otherwise `prompt_timeout`. Service-account calls get a
-30 s network deadline. At the deadline op-fast kills the child.
+30 s network deadline. At the deadline op-fast kills the child's whole
+process group (the child runs in its own group), so helpers it spawned die
+too.
 
-Expired entries stay in the store for `stale_grace`. When a fetch fails
-because approval was unavailable (deadline hit, `authorization timeout`,
-`authorization prompt dismissed`, desktop app unreachable) and an expired
-entry is inside the grace window, op-fast returns it and prints:
+Expired entries stay in the store for `stale_grace`, so a cached value is
+retained for its TTL **plus** `stale_grace` (default 30 days) before GC
+removes it. When a desktop-auth fetch fails because approval was
+unavailable and an expired entry is inside the grace window, op-fast
+returns it and prints:
 
 ```
 warning: served expired cache for <ref> (expired <age> ago); 1Password approval unavailable
 ```
 
-It never serves stale for other failures (item not found, invalid
-reference, permission denied), never under `--refresh`, and never with
-`OP_FAST_NO_STALE=1`.
+"Approval unavailable" means op-fast's deadline killed the call, or op's
+message (after its `[ERROR] <timestamp>` prefix, with the reference text and
+every quoted segment removed) starts with a known client-initialization or
+desktop-connection prefix such as
+`error initializing client: authorization timeout`. Not-found, permission,
+invalid-reference, and rate-limit failures are classified first, so an item
+named "authorization timeout" cannot trigger a stale read. A
+service-account call is never approval-unavailable and never serves stale.
+op-fast never serves stale under `--refresh` or with `OP_FAST_NO_STALE`
+set.
+
+Limit: any process running as your user can make a desktop fetch fail (for
+example by setting `OP_FAST_PROMPT_TIMEOUT=1s` or by dismissing the prompt)
+and so obtain an expired value that is still within `stale_grace`. That
+caller could already read the same Keychain items, so this is not a
+privilege boundary, but it does mean expiry alone does not revoke access.
+Lower `stale_grace`, set `OP_FAST_NO_STALE=1`, or `op-fast store clear '<ref>'`
+after a rotation to cut that window.
 
 ### Exit codes
 

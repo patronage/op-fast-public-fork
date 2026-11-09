@@ -82,16 +82,21 @@ pub struct ReadArgs {
 }
 
 pub fn execute(args: ReadArgs, sa: Option<&str>) -> Result<()> {
-    if args.force && args.out_file.is_none() {
-        eprintln!("note: -f does not refresh the cache; use --refresh");
-    }
+    // Expand `$VAR` first so the cache key, account selection, and audit
+    // all use the reference that is actually fetched.
+    let reference = crate::template::resolve_variables(&args.reference);
 
     let config = Config::load()?;
     let fetcher = Fetcher::new(&config, sa, "read")?;
-    let mut values = fetcher.resolve(std::slice::from_ref(&args.reference), args.refresh)?;
+    let mut values = fetcher.resolve(std::slice::from_ref(&reference), args.refresh)?;
     let value = values
-        .remove(&args.reference)
+        .remove(&reference)
         .context("op returned no value for the reference")?;
+
+    // Printed only on success, so exit 75 keeps its single stderr line.
+    if args.force && args.out_file.is_none() {
+        eprintln!("note: -f does not refresh the cache; use --refresh");
+    }
 
     if let Some(out_file) = &args.out_file {
         crate::output::write_secret_file(out_file, value.as_bytes(), args.file_mode)?;

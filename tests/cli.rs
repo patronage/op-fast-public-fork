@@ -95,6 +95,8 @@ impl Env {
             .env("OP_FAST_TEST_KEYRING_DIR", self.dir.join("keyring"))
             .env("OP_FAST_KEYRING_SERVICE", "op-fast-integration-test")
             .env("OP_FAST_PROMPT_TIMEOUT", "2s")
+            // Debug-only escape: the fake `op` is not signed by 1Password.
+            .env("OP_FAST_TEST_UNSIGNED_DELEGATE", "1")
             .env("FAKE_OP_VALUES", self.dir.join("values"))
             .env("FAKE_OP_LOG", self.dir.join("log"))
             .env("FAKE_OP_TOKENS", self.dir.join("tokens"))
@@ -381,8 +383,8 @@ fn bypass_sends_everything_to_real_op() {
         assert_eq!(stdout(&out), "fake-value-1\n");
     }
     assert_eq!(env.calls().len(), 2, "bypass must never serve from cache");
-    let out = env.run(&["store", "list"]);
-    assert_eq!(stdout(&out), "fake-op: store list\n");
+    let out = env.run(&["item", "list"]);
+    assert_eq!(stdout(&out), "fake-op: item list\n");
 }
 
 #[test]
@@ -791,8 +793,11 @@ fn passthrough_selects_by_vault_flag() {
     assert_ok(&env.run(&["item", "list", "--vault", "Agents"]));
     assert_ok(&env.run(&["item", "list"]));
     assert_ok(&env.run(&["read", "--account", "x", "--vault", "CI", "op://CI/c/f"]));
+    // --vault selects before a forced account (N10).
+    assert_ok(&env.run(&["--sa", "none", "item", "list", "--vault", "Agents"]));
+    assert_ok(&env.run(&["--sa", "ci", "item", "list"]));
     let labels: Vec<String> = env.calls().into_iter().map(|c| c.0).collect();
-    assert_eq!(labels, ["agents", "unset", "ci"]);
+    assert_eq!(labels, ["agents", "unset", "ci", "agents", "ci"]);
 }
 
 #[test]
@@ -1023,7 +1028,7 @@ fn ref_prints_id_based_reference_and_no_values() {
 
     let out = env.run(&["ref", "Stripe (live)", "secret key", "--vault", "Agents"]);
     assert_ok(&out);
-    assert_eq!(stdout(&out), "op://vltfake456/itmfake123/fldfake789\n");
+    assert_eq!(stdout(&out), "op://Agents/itmfake123/fldfake789\n");
     let calls = env.calls();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "agents");
@@ -1042,7 +1047,7 @@ fn ref_prints_id_based_reference_and_no_values() {
 
     let all = env.run(&["ref", "Stripe (live)", "--vault", "Agents"]);
     assert_ok(&all);
-    assert!(stdout(&all).contains("op://vltfake456/itmfake123/username\tusername"));
+    assert!(stdout(&all).contains("op://Agents/itmfake123/username\tusername"));
     for o in [&out, &all] {
         assert!(!stdout(o).contains("SECRET-FAKE"));
         assert!(!stderr(o).contains("SECRET-FAKE"));
@@ -1122,4 +1127,627 @@ fn audit_records_error_class_account_session_and_summary_json() {
     assert_ok(&out);
     let summary: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(summary["by_error_class"]["approval-unavailable"], 1);
+}
+
+// ------------------------------------------------------ review round 1
+
+fn without_signature_escape(env: &Env) -> Command {
+    let mut cmd = env.cmd();
+    cmd.env_remove("OP_FAST_TEST_UNSIGNED_DELEGATE");
+    cmd
+}
+
+#[test]
+fn b1_signature_check_is_active_by_default_in_debug_builds() {
+    let env = sa_env();
+    let out = without_signature_escape(&env)
+        .args(["read", "op://Agents/a/f"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("not signed by 1Password"), "{}", err);
+    assert!(err.contains(env.fake.to_str().unwrap()), "{}", err);
+    assert!(env.calls().is_empty(), "no delegate call may carry a token");
+
+    // Passthrough refuses too.
+    let out = without_signature_escape(&env)
+        .args(["item", "list", "--vault", "Agents"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(env.calls().is_empty());
+
+    // Desktop references are unaffected.
+    let out = without_signature_escape(&env)
+        .args(["read", "op://Private/p/f"])
+        .output()
+        .unwrap();
+    assert_ok(&out);
+    assert_no_token_leak(&env, &[&out]);
+}
+
+#[test]
+fn b1_printenv_as_delegate_never_receives_the_token() {
+    let env = sa_env();
+    let out = without_signature_escape(&env)
+        .env("OP_FAST_COMMAND", "/usr/bin/printenv")
+        .args(["--sa", "agents", "OP_SERVICE_ACCOUNT_TOKEN"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_no_token_leak(&env, &[&out]);
+
+    // Token-eligible paths refuse the unsigned delegate by name.
+    for args in [
+        vec!["--sa", "agents", "read", "op://Private/p/f"],
+        vec![
+            "--sa",
+            "agents",
+            "read",
+            "--account",
+            "x",
+            "op://Private/p/f",
+        ],
+        vec!["--sa", "agents", "whoami"],
+    ] {
+        let out = without_signature_escape(&env)
+            .env("OP_FAST_COMMAND", "/usr/bin/printenv")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{:?}", args);
+        assert!(
+            stderr(&out).contains("/usr/bin/printenv"),
+            "{}",
+            stderr(&out)
+        );
+        assert_no_token_leak(&env, &[&out]);
+    }
+}
+
+#[test]
+fn b2_passthrough_run_under_an_account_is_refused() {
+    let env = sa_env();
+    for args in [
+        vec![
+            "--sa",
+            "agents",
+            "run",
+            "--environment",
+            "x",
+            "--",
+            "printenv",
+            "OP_SERVICE_ACCOUNT_TOKEN",
+        ],
+        vec![
+            "run",
+            "--environment",
+            "x",
+            "--vault",
+            "Agents",
+            "--",
+            "printenv",
+            "OP_SERVICE_ACCOUNT_TOKEN",
+        ],
+    ] {
+        let out = env.run(&args);
+        assert!(!out.status.success(), "{:?}", args);
+        assert!(
+            stderr(&out).contains("refusing to pass service account"),
+            "{}",
+            stderr(&out)
+        );
+        assert_no_token_leak(&env, &[&out]);
+    }
+    assert!(env.calls().is_empty());
+
+    // Without an account the fake execs the child normally.
+    let out = env.run(&["run", "--environment", "x", "--", "echo", "child-ran"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "child-ran\n");
+}
+
+#[test]
+fn b2_non_allowlisted_passthrough_gets_desktop_auth() {
+    let env = sa_env();
+    let out = env.run(&["plugin", "list", "--vault", "Agents"]);
+    assert_ok(&out);
+    assert!(stderr(&out).contains("is not used for `op plugin`"));
+    assert_eq!(env.calls()[0].0, "unset");
+    let out = env.run(&["item", "get", "x", "--vault", "Agents"]);
+    assert_ok(&out);
+    assert_eq!(env.calls()[1].0, "agents");
+}
+
+fn path_env() -> (Env, PathBuf) {
+    let env = Env::new();
+    env.set_values(&[("op://Private/db/password", "real-fake-value")]);
+    let shim_dir = env.dir.join("shim");
+    let real_dir = env.dir.join("real");
+    let cwd = env.dir.join("repo");
+    for d in [&shim_dir, &real_dir, &cwd] {
+        fs::create_dir_all(d).unwrap();
+    }
+    std::os::unix::fs::symlink(BIN, shim_dir.join("op")).unwrap();
+    write_exe(&real_dir.join("op"), FAKE_OP);
+    let marker = env.dir.join("evil-ran");
+    write_exe(
+        &cwd.join("op"),
+        &format!("#!/bin/sh\necho evil-value\ntouch {}\n", marker.display()),
+    );
+    (env, cwd)
+}
+
+#[test]
+fn b3_repo_local_op_is_never_the_delegate() {
+    for middle in [":.:", "::", ":"] {
+        let (env, cwd) = path_env();
+        let path = format!(
+            "{}{}{}:/usr/bin:/bin",
+            env.dir.join("shim").display(),
+            middle,
+            env.dir.join("real").display()
+        );
+        let out = env
+            .base(&env.dir.join("shim").join("op"))
+            .current_dir(&cwd)
+            .env("PATH", path)
+            .args(["read", "op://Private/db/password"])
+            .output()
+            .unwrap();
+        assert_ok(&out);
+        assert_eq!(
+            stdout(&out),
+            "real-fake-value\n",
+            "PATH middle {:?}",
+            middle
+        );
+        assert!(
+            !env.dir.join("evil-ran").exists(),
+            "PATH middle {:?}",
+            middle
+        );
+    }
+
+    // Only relative entries: no delegate at all.
+    let (env, cwd) = path_env();
+    let out = env
+        .base(Path::new(BIN))
+        .current_dir(&cwd)
+        .env("PATH", ".:")
+        .args(["read", "op://Private/db/password"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!env.dir.join("evil-ran").exists());
+}
+
+#[test]
+fn b3_relative_op_fast_command_and_op_command_are_rejected() {
+    let (env, cwd) = path_env();
+    let out = env
+        .base(Path::new(BIN))
+        .current_dir(&cwd)
+        .env("OP_FAST_COMMAND", "op")
+        .args(["read", "op://Private/db/password"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("absolute path"), "{}", stderr(&out));
+
+    env.config("op_command = \"./op\"\n");
+    let out = env
+        .base(Path::new(BIN))
+        .current_dir(&cwd)
+        .args(["read", "op://Private/db/password"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("absolute path"), "{}", stderr(&out));
+    assert!(!env.dir.join("evil-ran").exists());
+}
+
+#[test]
+fn b4_deleted_item_named_like_an_approval_error_never_serves_stale() {
+    let reference = "op://Private/authorization timeout/password";
+    let env = Env::new();
+    env.config("default_ttl = \"1s\"\n");
+    env.set_values(&[(reference, "cached-fake")]);
+    assert_ok(&env.run(&["read", reference]));
+    std::thread::sleep(Duration::from_millis(2100));
+    let msg = format!(
+        "[ERROR] 2026/11/09 12:00:00 could not read secret '{}': \"authorization timeout\" isn't an item in the \"Private\" vault",
+        reference
+    );
+    let env = env.with("FAKE_OP_STDERR", &msg);
+    let out = env.run(&["read", reference]);
+    assert!(!out.status.success());
+    assert_eq!(stdout(&out), "");
+    assert!(!env.audit_text().contains("stale-served"));
+}
+
+#[test]
+fn b4_service_account_failure_never_serves_stale() {
+    let env = sa_env();
+    env.config(
+        "default_ttl = \"1s\"\n[[service_account]]\nname = \"agents\"\nvaults = [\"Agents\"]\n",
+    );
+    assert_ok(&env.run(&["read", "op://Agents/a/f"]));
+    std::thread::sleep(Duration::from_millis(2100));
+    for msg in [
+        "[ERROR] 2026/11/09 12:00:00 (401) Unauthorized: error initializing client: authorization timeout",
+        APPROVAL_TIMEOUT,
+    ] {
+        let out = env
+            .cmd()
+            .env("FAKE_OP_STDERR", msg)
+            .args(["read", "op://Agents/a/f"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{}", msg);
+        assert_ne!(out.status.code(), Some(75));
+        assert_eq!(stdout(&out), "");
+    }
+    assert!(!env.audit_text().contains("stale-served"));
+}
+
+#[test]
+fn b5_invoked_as_op_meta_flags_go_to_real_op() {
+    let env = Env::new();
+    let shim_dir = env.dir.join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("op");
+    std::os::unix::fs::symlink(BIN, &shim).unwrap();
+    let run_as = |prog: &Path, args: &[&str]| {
+        env.base(prog)
+            .env("OP_FAST_COMMAND", &env.fake)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    assert_eq!(stdout(&run_as(&shim, &["--version"])), "2.99.0-fake\n");
+    assert_eq!(stdout(&run_as(&shim, &["-v"])), "fake-op: -v\n");
+    assert_eq!(stdout(&run_as(&shim, &["--help"])), "fake-op: --help\n");
+    assert_eq!(stdout(&run_as(&shim, &["help"])), "fake-op: help\n");
+    assert_eq!(stdout(&run_as(&shim, &[])), "fake-op: \n");
+
+    let own = run_as(Path::new(BIN), &["--version"]);
+    assert!(stdout(&own).starts_with("op-fast "), "{}", stdout(&own));
+    let help = run_as(Path::new(BIN), &["--help"]);
+    assert!(stdout(&help).contains("agent-help"));
+}
+
+#[test]
+fn n1_passthrough_survives_a_broken_config() {
+    let env = Env::new();
+    env.config("this is = = not toml");
+    let out = env.run(&["item", "list"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "fake-op: item list\n");
+    assert_eq!(
+        stderr(&out).matches("warning").count(),
+        1,
+        "{}",
+        stderr(&out)
+    );
+
+    let out = env.run(&["--sa", "nobody", "item", "list"]);
+    assert!(!out.status.success(), "unknown --sa stays a hard error");
+    let env = env.with("OP_FAST_ACCOUNT", "nobody");
+    assert!(!env.run(&["item", "list"]).status.success());
+}
+
+#[test]
+fn n2_deadline_kills_the_whole_process_group() {
+    let pidfile = std::env::temp_dir().join(format!("op-fast-gc-pid-{}", std::process::id()));
+    let env = Env::new()
+        .with("FAKE_OP_GRANDCHILD", pidfile.to_str().unwrap())
+        .with("OP_FAST_PROMPT_TIMEOUT", "1s");
+    let start = Instant::now();
+    let out = env.run(&["read", "op://Private/db/password"]);
+    let elapsed = start.elapsed();
+    assert_eq!(out.status.code(), Some(75));
+    assert!(elapsed < Duration::from_millis(2500), "took {:?}", elapsed);
+    let pid = fs::read_to_string(&pidfile).unwrap().trim().to_string();
+    let _ = fs::remove_file(&pidfile);
+    let mut alive = true;
+    for _ in 0..20 {
+        alive = Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!alive, "grandchild {} survived the deadline kill", pid);
+}
+
+#[test]
+fn n4_doctor_checks_token_presence_without_reading_it() {
+    let env = sa_env();
+    // Make every stored token unreadable: a value read would fail.
+    for dir in fs::read_dir(env.dir.join("keyring")).unwrap().flatten() {
+        for f in fs::read_dir(dir.path()).unwrap().flatten() {
+            fs::set_permissions(f.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        }
+    }
+    let out = env.run(&["doctor", "--json"]);
+    assert_ok(&out);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(report["service_accounts"][0]["token_present"], true);
+    let out = env.run(&["sa", "list", "--json"]);
+    assert_ok(&out);
+    let rows: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(rows[0]["token"], true);
+}
+
+#[test]
+fn n5_no_stale_uses_the_shared_truthiness_rules() {
+    let env = expired_env()
+        .with("FAKE_OP_STDERR", APPROVAL_TIMEOUT)
+        .with("OP_FAST_NO_STALE", "false");
+    let out = env.run(&["read", "op://Private/db/password"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "cached-fake\n");
+}
+
+#[test]
+fn n6_sa_is_stripped_anywhere_and_bypass_keeps_local_commands() {
+    let env = sa_env();
+    assert_ok(&env.run(&["item", "list", "--sa", "ci", "--refresh"]));
+    let calls = env.calls();
+    assert_eq!(args_of(&calls[0]), ["item", "list"]);
+    assert_eq!(calls[0].0, "ci");
+
+    let env = env.with("OP_FAST_BYPASS", "1");
+    env.clear_calls();
+    let out = env.run(&["doctor", "--json"]);
+    assert_ok(&out);
+    assert!(stdout(&out).contains("\"op_fast_version\""));
+    assert!(env.run(&["agent-help"]).status.success());
+    assert_ok(&env.run(&["--sa", "agents", "item", "list"]));
+    let calls = env.calls();
+    let last = calls.last().unwrap();
+    assert_eq!(args_of(last), ["item", "list"]);
+    assert_eq!(last.0, "unset", "bypass never injects a token");
+}
+
+#[test]
+fn n7_token_key_and_invalid_names_are_never_echoed() {
+    let env = Env::new();
+    env.config("[[service_account]]\nname = \"a\"\ntoken = \"FAKE-CONFIG-SECRET-VALUE\"\n");
+    let out = env.run(&["read", "op://Private/x/y"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("token"));
+    assert!(
+        !stderr(&out).contains("FAKE-CONFIG-SECRET-VALUE"),
+        "{}",
+        stderr(&out)
+    );
+
+    let env = Env::new();
+    let long = "y".repeat(70);
+    for name in ["ops_FAKEFAKEFAKE", long.as_str()] {
+        let out = env.run_stdin(&["sa", "add", name, "--stdin"], "x");
+        assert!(!out.status.success());
+        assert!(!stderr(&out).contains(name), "{}", stderr(&out));
+        let out = env.run(&["--sa", name, "read", "op://Private/x/y"]);
+        assert!(!stderr(&out).contains(name), "{}", stderr(&out));
+    }
+}
+
+#[test]
+fn n8_prompt_timeout_is_floored_at_one_second() {
+    let env = Env::new()
+        .with("FAKE_OP_SLEEP", "30")
+        .with("OP_FAST_PROMPT_TIMEOUT", "0s");
+    let start = Instant::now();
+    let out = env.run(&["read", "op://Private/db/password"]);
+    assert_eq!(out.status.code(), Some(75));
+    assert!(
+        start.elapsed() >= Duration::from_millis(950),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn n9_exit_75_with_force_flag_prints_one_line() {
+    let env = Env::new().with("FAKE_OP_STDERR", APPROVAL_TIMEOUT);
+    let out = env.run(&["read", "-f", "op://Private/db/password"]);
+    assert_eq!(out.status.code(), Some(75));
+    assert_eq!(stderr(&out).lines().count(), 1, "{}", stderr(&out));
+}
+
+#[test]
+fn n11_sigint_during_hidden_prompt_restores_echo() {
+    if !Path::new("/usr/bin/expect").exists() {
+        eprintln!("skipping: /usr/bin/expect not available");
+        return;
+    }
+    let env = Env::new();
+    env.config(TWO_ACCOUNTS);
+    let script = env.dir.join("sigint.exp");
+    let mut vars = String::new();
+    for key in [
+        "OP_FAST_STORE_DIR",
+        "OP_FAST_CONFIG",
+        "OP_FAST_TEST_KEYRING_DIR",
+        "OP_FAST_KEYRING_SERVICE",
+    ] {
+        let value = match key {
+            "OP_FAST_STORE_DIR" => env.dir.join("store").display().to_string(),
+            "OP_FAST_CONFIG" => env.dir.join("config.toml").display().to_string(),
+            "OP_FAST_TEST_KEYRING_DIR" => env.dir.join("keyring").display().to_string(),
+            _ => "op-fast-integration-test".to_string(),
+        };
+        vars.push_str(&format!("set env({}) {{{}}}\n", key, value));
+    }
+    fs::write(
+        &script,
+        format!(
+            r#"set timeout 10
+{vars}spawn /bin/sh -c {{trap 'stty -a; exit 0' INT; "{bin}" sa add agents; stty -a}}
+expect "token for agents: "
+send "\003"
+expect {{
+  -re {{lflags:[^\n]*-echo }} {{ puts "RESULT=echo-off"; exit 0 }}
+  -re {{lflags:[^\n]* echo }} {{ puts "RESULT=echo-on"; exit 0 }}
+  timeout {{ puts "RESULT=timeout"; exit 1 }}
+}}
+"#,
+            vars = vars,
+            bin = BIN
+        ),
+    )
+    .unwrap();
+    let out = Command::new("/usr/bin/expect")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let text = stdout(&out);
+    assert!(text.contains("RESULT=echo-on"), "{}", text);
+}
+
+#[test]
+fn p1_variables_expand_before_caching() {
+    let env = Env::new();
+    env.set_values(&[
+        ("op://prod/db/password", "prod-fake"),
+        ("op://dev/db/password", "dev-fake"),
+    ]);
+    let mut env = env.with("VAULT", "prod");
+    assert_eq!(
+        stdout(&env.run(&["read", "op://$VAULT/db/password"])),
+        "prod-fake\n"
+    );
+    env.set("VAULT", "dev");
+    assert_eq!(
+        stdout(&env.run(&["read", "op://$VAULT/db/password"])),
+        "dev-fake\n"
+    );
+    let audit = env.audit_text();
+    assert!(audit.contains("\"reference\":\"op://dev/db/password\""));
+    assert!(!audit.contains("$VAULT"));
+    let out = env.run(&[
+        "status",
+        "--json",
+        "op://prod/db/password",
+        "op://dev/db/password",
+    ]);
+    let rows: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(rows[0]["state"], "valid");
+    assert_eq!(rows[1]["state"], "valid");
+}
+
+#[test]
+fn p2_masked_run_is_lossless() {
+    let env = Env::new().with("SECRET", "op://Private/db/password");
+    env.set_values(&[("op://Private/db/password", "fake-secret-xyz")]);
+    let out = env.run(&["run", "--", "sh", "-c", "seq 1 200000"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out).lines().count(), 200000);
+    assert!(stdout(&out).ends_with("200000\n"));
+
+    let out = env.run(&[
+        "run",
+        "--",
+        "sh",
+        "-c",
+        "printf 'a\\377b\\nafter fake-secret-xyz\\n'",
+    ]);
+    assert_ok(&out);
+    assert_eq!(
+        out.stdout,
+        b"a\xffb\nafter <concealed by 1Password>\n".to_vec()
+    );
+}
+
+#[test]
+fn p3_run_expands_env_before_detecting_and_leaves_argv_alone() {
+    let env = Env::new()
+        .with("VV", "Private")
+        .with("X", "op://$VV/i/f")
+        .with("BOTH", "op://Private/i/f C=op://Private/j/f");
+    env.set_values(&[
+        ("op://Private/i/f", "one-fake"),
+        ("op://Private/j/f", "two-fake"),
+    ]);
+    let out = env.run(&[
+        "run",
+        "--no-masking",
+        "--",
+        "sh",
+        "-c",
+        "printenv X; printenv BOTH",
+    ]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "one-fake\none-fake C=two-fake\n");
+
+    // argv is never expanded or substituted by op-fast.
+    let out = env.run(&[
+        "run",
+        "--no-masking",
+        "--",
+        "echo",
+        "op://Private/i/f",
+        "$X",
+    ]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "op://Private/i/f $X\n");
+}
+
+#[test]
+fn gc_keeps_entries_inside_grace_and_deletes_past_it() {
+    let env = Env::new();
+    env.config("default_ttl = \"1s\"\nstale_grace = \"2s\"\n");
+    env.set_values(&[
+        ("op://Private/old/f", "o"),
+        ("op://Private/new/f", "n"),
+        ("op://Private/x/f", "x"),
+    ]);
+    assert_ok(&env.run(&["read", "op://Private/old/f"]));
+    std::thread::sleep(Duration::from_millis(3200));
+    assert_ok(&env.run(&["read", "op://Private/new/f"]));
+    std::thread::sleep(Duration::from_millis(2100));
+    // old: expired ~4s ago (past grace); new: expired ~1s ago (in grace).
+    let env = env.with("OP_FAST_TEST_FORCE_GC", "1");
+    assert_ok(&env.run(&["read", "op://Private/x/f"]));
+    let out = env.run(&["store", "list", "--json"]);
+    let rows: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let refs: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["reference"].as_str().unwrap())
+        .collect();
+    assert!(!refs.contains(&"op://Private/old/f"), "{:?}", refs);
+    assert!(refs.contains(&"op://Private/new/f"), "{:?}", refs);
+}
+
+#[test]
+fn force_note_absent_with_out_file_and_out_file_mode_is_600() {
+    let env = Env::new();
+    env.set_values(&[("op://Private/a/f", "file-fake")]);
+    let path = env.dir.join("secret.out");
+    let out = env.run(&[
+        "read",
+        "-f",
+        "-o",
+        path.to_str().unwrap(),
+        "op://Private/a/f",
+    ]);
+    assert_ok(&out);
+    assert_eq!(stderr(&out), "");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "file-fake");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }

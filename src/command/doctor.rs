@@ -69,7 +69,8 @@ struct StoreReport {
 struct AccountReport {
     name: String,
     vaults: Vec<String>,
-    token_present: bool,
+    /// `null` = unknown (no attribute-only keyring lookup on this platform).
+    token_present: Option<bool>,
 }
 
 fn dur(d: std::time::Duration) -> String {
@@ -79,7 +80,7 @@ fn dur(d: std::time::Duration) -> String {
 pub fn execute(args: DoctorArgs, sa: Option<&str>) -> Result<()> {
     let (config, config_error) = match Config::load() {
         Ok(c) => (c, None),
-        Err(e) => (Config::load_or_default(), Some(format!("{:#}", e))),
+        Err(e) => (Config::defaults(), Some(format!("{:#}", e))),
     };
     let config_path = if config.path.as_os_str().is_empty() {
         std::env::var("OP_FAST_CONFIG").unwrap_or_default()
@@ -152,7 +153,7 @@ pub fn execute(args: DoctorArgs, sa: Option<&str>) -> Result<()> {
             .map(|a| AccountReport {
                 name: a.name.clone(),
                 vaults: a.vaults.clone(),
-                token_present: account::has_token(&a.name),
+                token_present: account::token_present(&a.name),
             })
             .collect(),
         ambient_service_account_token: std::env::var_os(account::TOKEN_ENV)
@@ -213,10 +214,10 @@ pub fn execute(args: DoctorArgs, sa: Option<&str>) -> Result<()> {
             "account:    {} [{}] token {}",
             a.name,
             a.vaults.join(", "),
-            if a.token_present {
-                "present"
-            } else {
-                "MISSING"
+            match a.token_present {
+                Some(true) => "present",
+                Some(false) => "MISSING",
+                None => "unknown",
             }
         );
     }

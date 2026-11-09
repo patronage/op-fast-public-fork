@@ -65,8 +65,8 @@ impl<'a> Selector<'a> {
             Some(name) => {
                 if config.account(name).is_none() {
                     bail!(
-                        "unknown service account {:?} (configured: {})",
-                        name,
+                        "unknown service account {} (configured: {})",
+                        crate::config::display_account_name(name),
                         configured_names(config)
                     );
                 }
@@ -88,30 +88,43 @@ impl<'a> Selector<'a> {
         self.select(vault_of(reference))
     }
 
-    /// Account for a passthrough command, given its `--vault` (if any).
+    /// Account for a passthrough command: ambient token, then the account
+    /// covering `--vault` (if any), then the forced account, then desktop.
     pub fn for_vault(&self, vault: Option<&str>) -> Auth {
-        self.select(vault)
+        if self.ambient {
+            return Auth::Ambient;
+        }
+        if let Some(account) = vault.and_then(|v| self.covering(v)) {
+            return Auth::Account(account.name.clone());
+        }
+        self.forced_or_desktop()
     }
 
     fn select(&self, vault: Option<&str>) -> Auth {
         if self.ambient {
             return Auth::Ambient;
         }
+        if self.forced.is_some() {
+            return self.forced_or_desktop();
+        }
+        match vault.and_then(|v| self.covering(v)) {
+            Some(account) => Auth::Account(account.name.clone()),
+            None => Auth::Desktop,
+        }
+    }
+
+    fn covering(&self, vault: &str) -> Option<&ServiceAccount> {
+        self.config
+            .service_accounts
+            .iter()
+            .find(|a| a.covers_vault(vault))
+    }
+
+    fn forced_or_desktop(&self) -> Auth {
         match &self.forced {
-            Some(Forced::Desktop) => return Auth::Desktop,
-            Some(Forced::Account(name)) => return Auth::Account(name.clone()),
-            None => {}
+            Some(Forced::Account(name)) => Auth::Account(name.clone()),
+            _ => Auth::Desktop,
         }
-        if let Some(vault) = vault
-            && let Some(account) = self
-                .config
-                .service_accounts
-                .iter()
-                .find(|a| a.covers_vault(vault))
-        {
-            return Auth::Account(account.name.clone());
-        }
-        Auth::Desktop
     }
 
     pub fn service_account(&self, auth: &Auth) -> Option<&ServiceAccount> {
@@ -161,8 +174,10 @@ pub fn load_token(name: &str) -> Result<Option<String>> {
     crate::keyring::get(&crate::keyring::account_service(), name)
 }
 
-pub fn has_token(name: &str) -> bool {
-    matches!(load_token(name), Ok(Some(t)) if !t.is_empty())
+/// Whether a token is stored, without reading it. `None` when the backend
+/// offers no attribute-only lookup (reported as "unknown").
+pub fn token_present(name: &str) -> Option<bool> {
+    crate::keyring::exists(&crate::keyring::account_service(), name)
 }
 
 pub fn store_token(name: &str, token: &str) -> Result<()> {
@@ -227,6 +242,19 @@ mod tests {
         );
         assert_eq!(s.for_reference("op://Private/i/f"), Auth::Desktop);
         assert_eq!(s.for_vault(None), Auth::Desktop);
+    }
+
+    #[test]
+    fn passthrough_vault_flag_selects_before_forced_account() {
+        let c = config();
+        let none = selector(&c, Some(Forced::Desktop), false);
+        assert_eq!(none.for_vault(Some("CI")), Auth::Account("ci".into()));
+        assert_eq!(none.for_vault(Some("Private")), Auth::Desktop);
+        let agents = selector(&c, Some(Forced::Account("agents".into())), false);
+        assert_eq!(agents.for_vault(Some("CI")), Auth::Account("ci".into()));
+        assert_eq!(agents.for_vault(None), Auth::Account("agents".into()));
+        let ambient = selector(&c, None, true);
+        assert_eq!(ambient.for_vault(Some("CI")), Auth::Ambient);
     }
 
     #[test]

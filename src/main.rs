@@ -62,7 +62,15 @@ fn main() {
 }
 
 fn run(args: Vec<OsString>) -> anyhow::Result<()> {
-    if command::is_truthy(std::env::var_os("OP_FAST_BYPASS").as_deref()) {
+    // Invoked as `op`: version, help, and a bare call belong to the real op.
+    if command::is_op_meta_invocation(&args) {
+        let rest: Vec<OsString> = args.iter().skip(1).cloned().collect();
+        return command::raw_delegate(&rest, "meta");
+    }
+
+    if command::is_truthy(std::env::var_os("OP_FAST_BYPASS").as_deref())
+        && !command::is_own_command(&args)
+    {
         return command::bypass(&args);
     }
 
@@ -71,7 +79,7 @@ fn run(args: Vec<OsString>) -> anyhow::Result<()> {
     match Cli::try_parse_from(&args) {
         Ok(cli) => command::execute(cli.subcommand, cli.sa.as_deref()),
         Err(err) if is_passthrough(&args, &err) => {
-            let (rest, sa) = command::strip_own_flags(&args);
+            let (rest, sa) = command::strip_own_flags(&args, true);
             command::passthrough(&rest, sa.as_deref(), "unmodeled-flag")
         }
         Err(err) => err.exit(),
