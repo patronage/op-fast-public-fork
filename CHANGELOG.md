@@ -1,8 +1,10 @@
-# Version 0.2.0-patronage.2
+# Version 0.2.0-patronage.3
 
 First published 0.2.0 build. The `v0.2.0-patronage.1` tag has no release:
 its pipeline failed closed on RUSTSEC-2026-0463 (`openssl` 0.10.75, a
-Linux-only transitive dependency). This version updates `openssl` to 0.10.82.
+Linux-only transitive dependency). `0.2.0-patronage.2` updated `openssl` to 0.10.82, and its build job was
+cancelled because the `macos-14` runner image is retired. This version
+builds on `macos-15`.
 
 Makes op-fast safe to install as the machine-wide `op`.
 

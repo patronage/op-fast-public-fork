@@ -62,7 +62,7 @@ jobs:
   build:
     name: Build and attest (aarch64-apple-darwin)
     needs: verify
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
