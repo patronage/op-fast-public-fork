@@ -37,7 +37,10 @@ Added in `0.2.0-patronage.1` (safe to install as the machine-wide `op`):
    binary can still swap it between that check and the exec. Passthrough gives a token only to an
    allowlist of non-executing subcommands, in a strict argv shape (the
    subcommand first, no flag before it or its sub-subcommand, no bare
-   `run`/`plugin`, no `--debug`/`--config`); passthrough `op run` under an
+   `run`/`plugin`, no `--debug[=…]`/`--config[=…]`), and every token-bearing
+   child runs without the caller's `OP_DEBUG`, `OP_CONFIG_DIR`, `OP_ACCOUNT`,
+   `OP_SESSION*`, `OP_CONNECT_*`, `OP_FORMAT`, `OP_CACHE`,
+   `OP_ISO_TIMESTAMPS`; passthrough `op run` under an
    account is refused. Non-macOS: tokens refused for now.
 6. **Fail fast** — delegate deadlines (60 s with a TTY, `prompt_timeout`
    otherwise, minimum 1 s; 30 s for service accounts), killing the whole

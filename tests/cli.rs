@@ -2448,3 +2448,67 @@ fn t5_unmodeled_flag_on_external_subcommand_keeps_refresh() {
         ["--format", "json", "item", "list", "--refresh"]
     );
 }
+
+// ------------------------------------------------------ review round 4
+
+#[test]
+fn u1_debug_equals_form_never_gets_a_token() {
+    let env = sa_env();
+    for args in [
+        vec!["item", "get", "y", "--vault", "Agents", "--debug=1"],
+        vec!["item", "get", "y", "--vault", "Agents", "--debug=true"],
+    ] {
+        env.clear_calls();
+        let out = env.run(&args);
+        assert_ok(&out);
+        assert_eq!(env.calls()[0].0, "unset", "{:?}", args);
+        assert_no_token_leak(&env, &[&out]);
+    }
+}
+
+#[test]
+fn u1_token_bearing_spawns_drop_op_env_and_desktop_spawns_keep_it() {
+    let env = sa_env();
+    let log = env.dir.join("envlog");
+    let env = env
+        .with("FAKE_OP_ENV_LOG", log.to_str().unwrap())
+        .with("OP_DEBUG", "true")
+        .with("OP_CONFIG_DIR", "/x")
+        .with("OP_ACCOUNT", "fake-account")
+        .with("OP_SESSION_fake", "fake-session")
+        .with("OP_FORMAT", "json");
+
+    // Modeled read under a selected account: token, no OP_* variables.
+    assert_ok(&env.run(&["read", "op://Agents/a/f"]));
+    // Allowlisted passthrough under an account: same.
+    assert_ok(&env.run(&["item", "list", "--vault", "Agents"]));
+    // Desktop auth: caller's environment unchanged.
+    assert_ok(&env.run(&["read", "op://Private/p/f"]));
+
+    let lines: Vec<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.len(), 3, "{:?}", lines);
+    let scrubbed = "OP_DEBUG=unset OP_CONFIG_DIR=unset OP_ACCOUNT=unset OP_SESSION_fake=unset OP_FORMAT=unset token=agents";
+    assert_eq!(lines[0], scrubbed);
+    assert_eq!(lines[1], scrubbed);
+    assert_eq!(
+        lines[2],
+        "OP_DEBUG=set OP_CONFIG_DIR=set OP_ACCOUNT=set OP_SESSION_fake=set OP_FORMAT=set token=unset"
+    );
+}
+
+#[test]
+fn u2_overlong_inherited_reference_is_passed_through_with_a_named_note() {
+    let env = Env::new().with("LONGREF", "op://V/a/b/c/d");
+    let out = env.run(&["run", "--no-masking", "--", "printenv", "LONGREF"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out), "op://V/a/b/c/d\n");
+    assert_eq!(
+        stderr(&out),
+        "op-fast: note: LONGREF looks like a secret reference but is not valid; passed through unchanged\n"
+    );
+    assert!(env.calls().is_empty());
+}

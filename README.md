@@ -139,7 +139,11 @@ fetches, caches, or audits a partly expanded reference.
   value (trimmed) is one `op://vault/item/field` reference; its variables
   are then expanded, and an unset one is an error. Every other inherited
   value, including one that merely mentions `op://`, reaches the child byte
-  for byte. Embedded references are resolved only from `--env-file`.
+  for byte. Embedded references are resolved only from `--env-file`. A
+  whole inherited value shaped like a reference but with five or more path
+  segments is passed through, and op-fast prints
+  `op-fast: note: <NAME> looks like a secret reference but is not valid; passed through unchanged`
+  (the name, never the value).
 
 Treat an `--env-file` like code: a hostile env file can build a reference
 from your environment values (for example `X=op://$SOME_VAR/item/field`).
@@ -253,7 +257,12 @@ op-fast sa remove agents
   `vault get|list`, `document get`, `whoami`, `user get --me`. The
   subcommand must be the first argument (after op-fast's own flags) and its
   sub-subcommand the next one; any flag before them, a bare `run` or
-  `plugin`, or `--debug`/`--config` anywhere before `--`, means no token. Any other passthrough runs
+  `plugin`, or `--debug`/`--debug=…`/`--config`/`--config=…` anywhere
+  before `--`, means no token.
+- Every token-bearing `op` child runs without the caller's `OP_DEBUG`,
+  `OP_CONFIG_DIR`, `OP_ACCOUNT`, `OP_SESSION`/`OP_SESSION_*`,
+  `OP_CONNECT_HOST`, `OP_CONNECT_TOKEN`, `OP_FORMAT`, `OP_CACHE`, and
+  `OP_ISO_TIMESTAMPS`. Desktop-auth children keep the caller's environment. Any other passthrough runs
   with desktop auth (with a note on stderr), and a passthrough `op run`
   under a selected account is refused. The process
   started by `op-fast run` never sees the token.

@@ -12,6 +12,7 @@
 #   FAKE_OP_FAIL_DESKTOP_ONLY  only fail when no token is set
 #   FAKE_OP_SLEEP   sleep this many seconds before answering
 #   FAKE_OP_ITEM_JSON  file printed for `item get`
+#   FAKE_OP_ENV_LOG  append which OP_* variables are set (presence only)
 #   FAKE_OP_TTY_READ  for `read`, read the value from /dev/tty instead
 #   FAKE_OP_GRANDCHILD  background a `sleep` and write its PID to this file
 #                       before sleeping (process-group kill test)
@@ -34,6 +35,15 @@ stdin_refs=""
 if [ "${1:-}" = "inject" ]; then
   template=$(cat)
   stdin_refs=$(printf '%s\n' "$template" | awk '/^op:\/\// { printf "\tstdin:%s", $0 }')
+fi
+
+if [ -n "${FAKE_OP_ENV_LOG:-}" ]; then
+  # Presence only, never values.
+  for v in OP_DEBUG OP_CONFIG_DIR OP_ACCOUNT OP_SESSION_fake OP_FORMAT; do
+    eval "isset=\${$v+x}"
+    if [ -n "$isset" ]; then printf '%s=set ' "$v"; else printf '%s=unset ' "$v"; fi
+  done >> "$FAKE_OP_ENV_LOG"
+  printf 'token=%s\n' "$label" >> "$FAKE_OP_ENV_LOG"
 fi
 
 if [ -n "${FAKE_OP_LOG:-}" ]; then

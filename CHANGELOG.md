@@ -42,6 +42,11 @@ Makes op-fast safe to install as the machine-wide `op`.
   `--debug`/`--config`; inherited env values are references only when whole;
   legacy control-character cache keys can be deleted; `${VAR:-default}`
   applies to empty values.
+- Round 4: `--debug=…` blocks the token like `--debug`; token-bearing `op`
+  children drop the caller's `OP_DEBUG`, `OP_CONFIG_DIR`, `OP_ACCOUNT`,
+  `OP_SESSION*`, `OP_CONNECT_*`, `OP_FORMAT`, `OP_CACHE`, `OP_ISO_TIMESTAMPS`;
+  `run` notes (by name) an inherited value shaped like a reference with five
+  or more segments.
 - Fixes: `read`/`run` expand `$VAR` before caching; masked `run` output is
   byte-exact and fully drained; `run` leaves argv untouched; a reference no
   longer swallows a following `op://` or `NAME=` across whitespace.

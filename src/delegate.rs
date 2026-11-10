@@ -208,6 +208,7 @@ impl OpDelegate {
         let mut cmd = self.command();
         if let Some(token) = token {
             self.verify_for_token()?;
+            scrub_op_env(&mut cmd);
             cmd.env(TOKEN_ENV, token);
         }
         Ok(cmd)
@@ -421,6 +422,32 @@ impl OpDelegate {
             .exec(&[OsString::from("--version")], None, &auth, auth.deadline)
             .ok()?;
         (out.code == Some(0)).then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+/// `op` environment variables that change what it prints, where it reads
+/// state from, or which account it uses. Removed from every token-bearing
+/// child; token-less spawns keep the caller's environment.
+pub const SCRUBBED_OP_ENV: &[&str] = &[
+    "OP_DEBUG",
+    "OP_CONFIG_DIR",
+    "OP_ACCOUNT",
+    "OP_SESSION",
+    "OP_CONNECT_HOST",
+    "OP_CONNECT_TOKEN",
+    "OP_FORMAT",
+    "OP_CACHE",
+    "OP_ISO_TIMESTAMPS",
+];
+
+fn scrub_op_env(cmd: &mut Command) {
+    for name in SCRUBBED_OP_ENV {
+        cmd.env_remove(name);
+    }
+    for (name, _) in env::vars_os() {
+        if name.to_str().is_some_and(|n| n.starts_with("OP_SESSION_")) {
+            cmd.env_remove(&name);
+        }
     }
 }
 

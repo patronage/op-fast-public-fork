@@ -211,10 +211,12 @@ pub fn token_allowed(args: &[OsString]) -> bool {
     }
     // `--debug` and `--config` change what `op` prints and where it reads
     // state from; never combine them with a token.
-    if words
-        .iter()
-        .any(|w| *w == "--debug" || *w == "--config" || w.starts_with("--config="))
-    {
+    if words.iter().any(|w| {
+        *w == "--debug"
+            || w.starts_with("--debug=")
+            || *w == "--config"
+            || w.starts_with("--config=")
+    }) {
         return false;
     }
     let first = words.first().copied();
@@ -468,6 +470,8 @@ mod tests {
         assert!(!ok(&["read", "op://a/b/c", "--debug"]));
         assert!(!ok(&["item", "list", "--config", "/tmp/x"]));
         assert!(!ok(&["item", "list", "--config=/tmp/x"]));
+        assert!(!ok(&["item", "get", "y", "--debug=1"]));
+        assert!(!ok(&["item", "get", "y", "--debug=true"]));
         assert!(ok(&["read", "op://a/b/c", "--", "--debug"]));
         assert!(ok(&["read", "op://a/b/c", "--", "run"]));
         for cmd in [

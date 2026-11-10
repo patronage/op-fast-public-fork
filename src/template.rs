@@ -150,6 +150,21 @@ pub fn is_whole_reference(value: &str) -> bool {
     (3..=4).contains(&segments.len()) && segments.iter().all(|s| !s.trim().is_empty())
 }
 
+/// Whether `value` (trimmed) is exactly one raw reference but has five or
+/// more path segments, so it cannot be a valid secret reference.
+pub fn looks_like_overlong_reference(value: &str) -> bool {
+    let value = value.trim();
+    let Ok(Some(m)) = RAW_REF.find(value) else {
+        return false;
+    };
+    if m.start() != 0 || m.end() != value.len() {
+        return false;
+    }
+    let path = value.trim_start_matches("op://");
+    let path = path.split('?').next().unwrap_or(path);
+    path.split('/').count() >= 5
+}
+
 /// Expand one secret reference strictly from the process environment.
 pub fn expand_reference(reference: &str) -> Result<String> {
     expand_with(reference, true, &env_lookup)
@@ -303,6 +318,14 @@ mod tests {
         assert!(!is_whole_reference("https://x.test/?next=op://V/zz"));
         assert!(!is_whole_reference("op://V//f"));
         assert!(!is_whole_reference("op://V/i/f op://V/j/f"));
+    }
+
+    #[test]
+    fn overlong_reference_shape() {
+        assert!(looks_like_overlong_reference("op://V/i/s/f/x"));
+        assert!(looks_like_overlong_reference(" op://V/a/b/c/d/e "));
+        assert!(!looks_like_overlong_reference("op://V/i/s/f"));
+        assert!(!looks_like_overlong_reference("use op://V/a/b/c/d here"));
     }
 
     #[test]

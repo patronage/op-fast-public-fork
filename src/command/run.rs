@@ -88,11 +88,17 @@ pub fn execute(args: RunArgs, sa: Option<&str>) -> Result<()> {
     // embedded in larger values are resolved, as before.
     let mut with_refs: BTreeMap<String, String> = BTreeMap::new();
     for (key, value) in std::env::vars_os() {
-        if let (Some(key), Some(value)) = (key.to_str(), value.to_str())
-            && template::is_whole_reference(value)
-        {
-            let expanded = template::expand_reference(value.trim())?;
-            with_refs.insert(key.to_string(), expanded);
+        if let (Some(key), Some(value)) = (key.to_str(), value.to_str()) {
+            if template::is_whole_reference(value) {
+                let expanded = template::expand_reference(value.trim())?;
+                with_refs.insert(key.to_string(), expanded);
+            } else if template::looks_like_overlong_reference(value) {
+                // Name only; never print the value.
+                eprintln!(
+                    "op-fast: note: {} looks like a secret reference but is not valid; passed through unchanged",
+                    key
+                );
+            }
         }
     }
 
