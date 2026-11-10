@@ -1,4 +1,8 @@
-# Version 0.2.0-patronage.1 (unreleased)
+# Version 0.2.0-patronage.2
+
+First published 0.2.0 build. The `v0.2.0-patronage.1` tag has no release:
+its pipeline failed closed on RUSTSEC-2026-0463 (`openssl` 0.10.75, a
+Linux-only transitive dependency). This version updates `openssl` to 0.10.82.
 
 Makes op-fast safe to install as the machine-wide `op`.
 
