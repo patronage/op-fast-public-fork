@@ -1,58 +1,348 @@
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{IsTerminal, Read, Write};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use which::which_global;
+
+use crate::account::{Auth, TOKEN_ENV};
+use crate::config::Config;
+use crate::error::{DelegateError, ErrorClass};
+
+/// Deadline when stderr is a TTY (someone may be at the desk to approve).
+pub const INTERACTIVE_DEADLINE: Duration = Duration::from_secs(60);
+/// Plain network deadline for service-account (and ambient-token) calls.
+pub const NETWORK_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Incremented on every delegate child. A copy of op-fast that finds
+/// another op-fast copy on PATH would otherwise recurse forever.
+const DEPTH_ENV: &str = "OP_FAST_DELEGATE_DEPTH";
+/// Canonical paths of op-fast executables already on this delegate chain
+/// (PATH-list syntax). The PATH walk skips them, so two op-fast files on
+/// PATH cost one extra hop instead of a loop.
+const VISITED_ENV: &str = "OP_FAST_VISITED";
+const MAX_DEPTH: u32 = 6;
+
+/// Code-signing requirement a delegate must satisfy before op-fast hands it
+/// a service-account token: Apple-anchored Developer ID issued to AgileBits
+/// (1Password), team 2BUA8C4S2C.
+pub const OP_SIGNING_REQUIREMENT: &str =
+    "anchor apple generic and certificate leaf[subject.OU] = \"2BUA8C4S2C\"";
+
+/// How one delegate call authenticates, with its token (if any) and deadline.
+pub struct CallAuth {
+    pub auth: Auth,
+    token: Option<String>,
+    pub deadline: Duration,
+}
+
+impl CallAuth {
+    pub fn new(auth: Auth, token: Option<String>, config: &Config) -> Self {
+        let deadline = deadline_for(&auth, config);
+        Self {
+            auth,
+            token,
+            deadline,
+        }
+    }
+
+    /// Remove any token text from delegate output before it is shown.
+    pub fn redact(&self, text: &str) -> String {
+        match &self.token {
+            Some(t) if !t.is_empty() => text.replace(t.as_str(), "<redacted>"),
+            _ => text.to_string(),
+        }
+    }
+}
+
+/// Deadline for a delegate call with `auth`.
+pub fn deadline_for(auth: &Auth, config: &Config) -> Duration {
+    deadline_for_tty(auth, config, std::io::stderr().is_terminal())
+}
+
+pub fn deadline_for_tty(auth: &Auth, config: &Config, stderr_is_tty: bool) -> Duration {
+    if auth.may_prompt() {
+        if stderr_is_tty {
+            INTERACTIVE_DEADLINE
+        } else {
+            config.prompt_timeout
+        }
+    } else {
+        NETWORK_DEADLINE
+    }
+}
 
 pub struct OpDelegate {
     command: PathBuf,
+    source: &'static str,
+}
+
+pub struct Output {
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+    pub timed_out: bool,
+}
+
+/// Resolve a configured delegate path: absolute only, canonicalized.
+fn absolute_delegate(raw: &Path, what: &str) -> Result<PathBuf> {
+    if !raw.is_absolute() {
+        bail!(
+            "{} must be an absolute path (got a relative path); refusing to guess",
+            what
+        );
+    }
+    fs::canonicalize(raw).with_context(|| format!("Failed to resolve {}: {}", what, raw.display()))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Candidate `op` binaries from absolute PATH entries only. Empty and
+/// relative entries (including `.`) are ignored so a repository-local `op`
+/// can never become the delegate.
+pub fn path_candidates(path_var: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let Some(path_var) = path_var else {
+        return Vec::new();
+    };
+    env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("op"))
+        .filter(|p| is_executable_file(p))
+        .collect()
 }
 
 impl OpDelegate {
     const ENV_VAR_NAME: &'static str = "OP_FAST_COMMAND";
 
-    pub fn new() -> Result<Self> {
-        if let Ok(var) = env::var(Self::ENV_VAR_NAME) {
-            let path = fs::canonicalize(&var)
-                .with_context(|| format!("Failed to resolve {}: {}", Self::ENV_VAR_NAME, var))?;
-            return Ok(Self { command: path });
+    /// Resolve the real `op`: `OP_FAST_COMMAND`, then config `op_command`,
+    /// then the first `op` in an absolute PATH entry that is not this
+    /// executable.
+    pub fn new(config: &Config) -> Result<Self> {
+        let depth = current_depth();
+        if depth >= MAX_DEPTH {
+            bail!(
+                "op-fast is delegating to itself ({} levels deep); set {} or op_command to the real `op`",
+                depth,
+                Self::ENV_VAR_NAME
+            );
         }
 
-        let command = which_global("op")
-            .context("Could not find `op` command in PATH")?
-            .canonicalize()
-            .context("Failed to canonicalize `op` path")?;
-
-        let command = match env::current_exe() {
-            Ok(current_path) if current_path == command => {
-                bail!(
-                    "Detected self-reference. Set {} to the original `op` binary path",
-                    Self::ENV_VAR_NAME
-                )
+        let me = env::current_exe().and_then(fs::canonicalize).ok();
+        let check_not_self = |path: PathBuf, what: &str| -> Result<PathBuf> {
+            if me.as_ref() == Some(&path) {
+                bail!("Detected self-reference: {} points at op-fast itself", what);
             }
-            _ => command,
+            Ok(path)
         };
 
-        Ok(Self { command })
-    }
-
-    pub fn read(&self, reference: &str) -> Result<String> {
-        let output = Command::new(&self.command)
-            .arg("read")
-            .arg(reference)
-            .output()
-            .context("Failed to execute `op read`")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("op read failed: {}", stderr);
+        if let Some(var) = env::var_os(Self::ENV_VAR_NAME).filter(|v| !v.is_empty()) {
+            let path = absolute_delegate(Path::new(&var), Self::ENV_VAR_NAME)?;
+            return Ok(Self {
+                command: check_not_self(path, Self::ENV_VAR_NAME)?,
+                source: "OP_FAST_COMMAND",
+            });
         }
 
-        let value = String::from_utf8(output.stdout)
+        if let Some(configured) = &config.op_command {
+            let path = absolute_delegate(configured, "op_command")?;
+            return Ok(Self {
+                command: check_not_self(path, "op_command")?,
+                source: "config op_command",
+            });
+        }
+
+        let visited = visited_paths();
+        for candidate in path_candidates(env::var_os("PATH").as_deref()) {
+            let Ok(path) = candidate.canonicalize() else {
+                continue;
+            };
+            if me.as_ref() == Some(&path) {
+                log::debug!("Skipping {} (it is op-fast itself)", candidate.display());
+                continue;
+            }
+            if visited.contains(&path) {
+                log::debug!(
+                    "Skipping {} (already on this delegate chain)",
+                    candidate.display()
+                );
+                continue;
+            }
+            return Ok(Self {
+                command: path,
+                source: "PATH",
+            });
+        }
+
+        bail!(
+            "Could not find the real `op` in PATH (only op-fast itself, or nothing); set {} or op_command",
+            Self::ENV_VAR_NAME
+        )
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.command
+    }
+
+    pub fn source(&self) -> &'static str {
+        self.source
+    }
+
+    /// Refuse to hand a service-account token to anything but a genuine,
+    /// 1Password-signed `op`.
+    pub fn verify_for_token(&self) -> Result<()> {
+        verify_signature(&self.command)
+    }
+
+    /// A command for passthrough (inherited stdio, no deadline). `token`
+    /// is set only after the delegate passes the signature check.
+    pub fn command_with_token(&self, token: Option<&str>) -> Result<Command> {
+        let mut cmd = self.command();
+        if let Some(token) = token {
+            self.verify_for_token()?;
+            scrub_op_env(&mut cmd);
+            cmd.env(TOKEN_ENV, token);
+        }
+        Ok(cmd)
+    }
+
+    /// A command with no token (inherited stdio, no deadline).
+    pub fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.command);
+        cmd.env(DEPTH_ENV, (current_depth() + 1).to_string());
+        let mut visited = visited_paths();
+        if let Ok(me) = env::current_exe().and_then(fs::canonicalize)
+            && !visited.contains(&me)
+        {
+            visited.push(me);
+        }
+        if let Ok(joined) = env::join_paths(&visited) {
+            cmd.env(VISITED_ENV, joined);
+        }
+        cmd
+    }
+
+    /// Run `op` with captured output, killing its whole process group at
+    /// `deadline`.
+    pub fn exec(
+        &self,
+        args: &[OsString],
+        stdin: Option<&[u8]>,
+        auth: &CallAuth,
+        deadline: Duration,
+    ) -> Result<Output> {
+        let mut cmd = self.command_with_token(auth.token.as_deref())?;
+        cmd.args(args)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Unattended (stderr not a TTY): own process group, so a deadline
+        // kill takes grandchildren too. On a TTY the child stays in the
+        // foreground group so an interactive `op` prompt can read /dev/tty.
+        let own_group = !std::io::stderr().is_terminal();
+        if own_group {
+            cmd.process_group(0);
+        }
+
+        let mut child = cmd.spawn().context("Failed to execute `op`")?;
+        let pgid = child.id() as libc::pid_t;
+
+        if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            let data = data.to_vec();
+            std::thread::spawn(move || {
+                let _ = pipe.write_all(&data);
+            });
+        }
+
+        let out_rx = spawn_reader(child.stdout.take());
+        let err_rx = spawn_reader(child.stderr.take());
+
+        let start = Instant::now();
+        let mut timed_out = false;
+        let code = loop {
+            if let Some(status) = child.try_wait().context("Failed to wait for `op`")? {
+                break status.code();
+            }
+            if start.elapsed() >= deadline {
+                if own_group {
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                timed_out = true;
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        // Both pipes drain concurrently in their own threads. After a kill
+        // the whole group is gone and the pipes close at once; after a
+        // normal exit, a lingering helper holding a pipe costs at most the
+        // grace period.
+        let grace = if timed_out {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(2)
+        };
+        let until = Instant::now() + grace;
+        let stdout = collect(&out_rx, until);
+        let stderr = collect(&err_rx, until);
+
+        Ok(Output {
+            code,
+            stdout,
+            stderr: auth.redact(&String::from_utf8_lossy(&stderr)),
+            timed_out,
+        })
+    }
+
+    fn failure(&self, out: &Output, auth: &CallAuth, what: &str, refs: &[&str]) -> DelegateError {
+        if out.timed_out {
+            let class = if auth.auth.may_prompt() {
+                ErrorClass::ApprovalUnavailable
+            } else {
+                ErrorClass::Other
+            };
+            return DelegateError {
+                class,
+                code: 1,
+                message: format!(
+                    "op-fast: `op {}` did not finish within {}s (auth: {})",
+                    what,
+                    auth.deadline.as_secs(),
+                    auth.auth.label()
+                ),
+            };
+        }
+        DelegateError {
+            class: ErrorClass::classify(&out.stderr, refs, auth.auth.may_prompt()),
+            code: out.code.unwrap_or(1),
+            message: out.stderr.clone(),
+        }
+    }
+
+    pub fn read(&self, reference: &str, auth: &CallAuth) -> Result<String> {
+        let args = [OsString::from("read"), OsString::from(reference)];
+        let out = self.exec(&args, None, auth, auth.deadline)?;
+        if out.timed_out || out.code != Some(0) {
+            return Err(self.failure(&out, auth, "read", &[reference]).into());
+        }
+
+        let value = String::from_utf8(out.stdout)
             .context("op read returned non-UTF8 output")?
             .trim_end()
             .to_string();
@@ -60,7 +350,11 @@ impl OpDelegate {
         Ok(value)
     }
 
-    pub fn read_batch(&self, references: &[&str]) -> Result<HashMap<String, String>> {
+    pub fn read_batch(
+        &self,
+        references: &[&str],
+        auth: &CallAuth,
+    ) -> Result<HashMap<String, String>> {
         if references.is_empty() {
             return Ok(HashMap::new());
         }
@@ -68,31 +362,17 @@ impl OpDelegate {
         let tag = std::process::id();
         let template = build_batch_template(references, tag);
 
-        let mut child = Command::new(&self.command)
-            .arg("inject")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to spawn `op inject`")?;
-
-        let stdin = child.stdin.as_mut().context("Failed to open stdin")?;
-        stdin
-            .write_all(template.as_bytes())
-            .context("Failed to write to op inject stdin")?;
-        let _ = stdin;
-
-        let output = child
-            .wait_with_output()
-            .context("Failed to wait for op inject")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("op inject failed: {}", stderr);
+        let out = self.exec(
+            &[OsString::from("inject")],
+            Some(template.as_bytes()),
+            auth,
+            auth.deadline,
+        )?;
+        if out.timed_out || out.code != Some(0) {
+            return Err(self.failure(&out, auth, "inject", references).into());
         }
 
-        let stdout =
-            String::from_utf8(output.stdout).context("op inject returned non-UTF8 output")?;
+        let stdout = String::from_utf8(out.stdout).context("op inject returned non-UTF8 output")?;
 
         let values = parse_batch_output(&stdout, references.len(), tag)?;
 
@@ -104,9 +384,176 @@ impl OpDelegate {
         Ok(result)
     }
 
-    pub fn command(&self) -> Command {
-        Command::new(&self.command)
+    /// `op item get <item> --format json [--vault v]`. Returns the parsed
+    /// JSON; the caller must never print field values from it.
+    pub fn item_get_json(
+        &self,
+        item: &str,
+        vault: Option<&str>,
+        auth: &CallAuth,
+    ) -> Result<serde_json::Value> {
+        // An item or vault that starts with `-` would be parsed as a flag
+        // (e.g. `--debug`) by `op`.
+        if item.starts_with('-') || vault.is_some_and(|v| v.starts_with('-')) {
+            bail!("item and vault names starting with '-' are not supported; use the item ID");
+        }
+        let mut args: Vec<OsString> = vec!["item".into(), "get".into(), item.into()];
+        if let Some(v) = vault {
+            args.push("--vault".into());
+            args.push(v.into());
+        }
+        args.push("--format".into());
+        args.push("json".into());
+        let out = self.exec(&args, None, auth, auth.deadline)?;
+        if out.timed_out || out.code != Some(0) {
+            return Err(self.failure(&out, auth, "item get", &[item]).into());
+        }
+        serde_json::from_slice(&out.stdout).context("op item get returned invalid JSON")
     }
+
+    /// `op --version`, which never prompts.
+    pub fn version(&self) -> Option<String> {
+        let auth = CallAuth {
+            auth: Auth::Desktop,
+            token: None,
+            deadline: Duration::from_secs(5),
+        };
+        let out = self
+            .exec(&[OsString::from("--version")], None, &auth, auth.deadline)
+            .ok()?;
+        (out.code == Some(0)).then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+/// `op` environment variables that change what it prints, where it reads
+/// state from, or which account it uses. Removed from every token-bearing
+/// child; token-less spawns keep the caller's environment.
+pub const SCRUBBED_OP_ENV: &[&str] = &[
+    "OP_DEBUG",
+    "OP_CONFIG_DIR",
+    "OP_ACCOUNT",
+    "OP_SESSION",
+    "OP_CONNECT_HOST",
+    "OP_CONNECT_TOKEN",
+    "OP_FORMAT",
+    "OP_CACHE",
+    "OP_ISO_TIMESTAMPS",
+];
+
+fn scrub_op_env(cmd: &mut Command) {
+    for name in SCRUBBED_OP_ENV {
+        cmd.env_remove(name);
+    }
+    for (name, _) in env::vars_os() {
+        if name.to_str().is_some_and(|n| n.starts_with("OP_SESSION_")) {
+            cmd.env_remove(&name);
+        }
+    }
+}
+
+/// Debug builds only: tests use a fake (unsigned) `op`, so they may opt out
+/// of the signature check. Release builds compile this to `false`.
+fn signature_check_skipped() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os("OP_FAST_TEST_UNSIGNED_DELEGATE").is_some_and(|v| v == "1") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Verify that `path` is the genuine 1Password CLI before it may receive a
+/// service-account token.
+pub fn verify_signature(path: &Path) -> Result<()> {
+    if !cfg!(target_os = "macos") && !signature_check_skipped() {
+        bail!(
+            "service-account tokens are only supported on macOS for now; refusing to pass a token to {}",
+            path.display()
+        );
+    }
+    // No cache: verify right before every token-bearing spawn, so a binary
+    // swapped after an earlier check is caught. (A same-user process can
+    // still swap the file between this check and the exec.)
+    let ok = run_codesign(path);
+    if !ok {
+        bail!(
+            "refusing to pass a service-account token to {}: it is not signed by 1Password (AgileBits, team 2BUA8C4S2C)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn visited_paths() -> Vec<PathBuf> {
+    env::var_os(VISITED_ENV)
+        .map(|v| env::split_paths(&v).filter(|p| p.is_absolute()).collect())
+        .unwrap_or_default()
+}
+
+/// One signature verification. Debug builds with the test escape log the
+/// call (so tests can count verifications) and pass.
+fn run_codesign(path: &Path) -> bool {
+    if signature_check_skipped() {
+        #[cfg(debug_assertions)]
+        if let Some(log) = std::env::var_os("OP_FAST_TEST_SIGNATURE_LOG") {
+            use std::io::Write as _;
+            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(log) {
+                let _ = writeln!(f, "{}", path.display());
+            }
+        }
+        return true;
+    }
+    Command::new("/usr/bin/codesign")
+        .arg("--verify")
+        .arg(format!("-R={}", OP_SIGNING_REQUIREMENT))
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn current_depth() -> u32 {
+    env::var(DEPTH_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let Some(mut pipe) = pipe else {
+            return;
+        };
+        let mut buf = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// Gather chunks until the reader hangs up or `until` passes.
+fn collect(rx: &mpsc::Receiver<Vec<u8>>, until: Instant) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let remaining = until.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(chunk) => out.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
+    }
+    out
 }
 
 fn sentinel(tag: u32, index: usize, end: bool) -> String {
@@ -137,7 +584,9 @@ pub(crate) fn parse_batch_output(output: &str, expected: usize, tag: u32) -> Res
                 if line == sentinel(tag, values.len(), false) {
                     current = Some(Vec::new());
                 } else {
-                    bail!("op inject output contains unexpected content outside a sentinel section");
+                    bail!(
+                        "op inject output contains unexpected content outside a sentinel section"
+                    );
                 }
             }
             Some(lines) => {
@@ -173,6 +622,69 @@ pub(crate) fn parse_batch_output(output: &str, expected: usize, tag: u32) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_selection_by_tty_and_auth() {
+        let mut config = Config::defaults();
+        config.prompt_timeout = Duration::from_secs(7);
+        assert_eq!(
+            deadline_for_tty(&Auth::Desktop, &config, true),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            deadline_for_tty(&Auth::Desktop, &config, false),
+            Duration::from_secs(7)
+        );
+        for auth in [Auth::Ambient, Auth::Account("a".into())] {
+            assert_eq!(
+                deadline_for_tty(&auth, &config, true),
+                Duration::from_secs(30)
+            );
+            assert_eq!(
+                deadline_for_tty(&auth, &config, false),
+                Duration::from_secs(30)
+            );
+        }
+    }
+
+    #[test]
+    fn path_candidates_ignore_relative_and_empty_entries() {
+        let base = std::env::temp_dir().join(format!("op-fast-path-test-{}", std::process::id()));
+        let abs = base.join("abs");
+        fs::create_dir_all(&abs).unwrap();
+        let op = abs.join("op");
+        fs::write(&op, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&op, fs::Permissions::from_mode(0o755)).unwrap();
+        let path_var = format!(".::relative/dir:{}", abs.display());
+        let found = path_candidates(Some(std::ffi::OsStr::new(&path_var)));
+        assert_eq!(found, vec![op]);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn relative_configured_delegates_are_rejected() {
+        assert!(absolute_delegate(Path::new("op"), "OP_FAST_COMMAND").is_err());
+        assert!(absolute_delegate(Path::new("./bin/op"), "op_command").is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn signature_requirement_rejects_other_signers() {
+        // Apple-signed system binaries are not AgileBits-signed.
+        let err = verify_signature(Path::new("/usr/bin/printenv")).unwrap_err();
+        assert!(err.to_string().contains("/usr/bin/printenv"));
+        // Unsigned scripts fail too.
+        assert!(verify_signature(Path::new("/bin/sh")).is_err());
+        // The genuine CLI passes, when installed on this machine.
+        for real in ["/opt/homebrew/bin/op", "/usr/local/bin/op"] {
+            let p = Path::new(real);
+            if p.exists() {
+                let canonical = p.canonicalize().unwrap();
+                assert!(verify_signature(&canonical).is_ok(), "{}", real);
+            }
+        }
+    }
 
     // Simulate what `op inject` produces for a template: each reference line
     // replaced by its value, all other lines passed through verbatim.
@@ -215,7 +727,10 @@ mod tests {
         let template = build_batch_template(&refs, 7);
         let output = simulate_inject(&template, &["-----BEGIN KEY-----\nabc\n-----END KEY-----"]);
         let values = parse_batch_output(&output, 1, 7).unwrap();
-        assert_eq!(values, vec!["-----BEGIN KEY-----\nabc\n-----END KEY-----".to_string()]);
+        assert_eq!(
+            values,
+            vec!["-----BEGIN KEY-----\nabc\n-----END KEY-----".to_string()]
+        );
     }
 
     #[test]

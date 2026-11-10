@@ -28,8 +28,11 @@ pub enum AuditSubcommand {
         lines: usize,
     },
 
-    #[clap(about = "Summarize audit events by outcome and reference")]
-    Summary,
+    #[clap(about = "Summarize audit events by outcome, error class, account, and reference")]
+    Summary {
+        #[clap(long, help = "Print JSON")]
+        json: bool,
+    },
 }
 
 pub fn execute(cmd: AuditCommand) -> Result<()> {
@@ -41,10 +44,7 @@ pub fn execute(cmd: AuditCommand) -> Result<()> {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
             .collect(),
-        Err(_) => {
-            println!("No audit log yet ({})", dir.display());
-            return Ok(());
-        }
+        Err(_) => Vec::new(),
     };
     files.sort();
 
@@ -55,6 +55,11 @@ pub fn execute(cmd: AuditCommand) -> Result<()> {
         all_lines.extend(contents.lines().map(|l| l.to_string()));
     }
 
+    if files.is_empty() && !matches!(cmd.command, AuditSubcommand::Summary { json: true }) {
+        println!("No audit log yet ({})", dir.display());
+        return Ok(());
+    }
+
     match cmd.command {
         AuditSubcommand::Tail { lines } => {
             let start = all_lines.len().saturating_sub(lines);
@@ -62,8 +67,12 @@ pub fn execute(cmd: AuditCommand) -> Result<()> {
                 println!("{}", line);
             }
         }
-        AuditSubcommand::Summary => {
+        AuditSubcommand::Summary { json } => {
             let summary = audit::summarize(all_lines.iter().map(|l| l.as_str()));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+                return Ok(());
+            }
             println!("Events: {}", summary.total);
             if summary.malformed > 0 {
                 println!("Malformed lines: {}", summary.malformed);
@@ -71,6 +80,18 @@ pub fn execute(cmd: AuditCommand) -> Result<()> {
             println!("\nBy outcome:");
             for (outcome, count) in &summary.by_outcome {
                 println!("  {:<12} {}", outcome, count);
+            }
+            if !summary.by_error_class.is_empty() {
+                println!("\nBy error class:");
+                for (class, count) in &summary.by_error_class {
+                    println!("  {:<22} {}", class, count);
+                }
+            }
+            if !summary.by_account.is_empty() {
+                println!("\nBy account:");
+                for (account, count) in &summary.by_account {
+                    println!("  {:<22} {}", account, count);
+                }
             }
             println!("\nBy reference:");
             for (reference, count) in &summary.by_reference {

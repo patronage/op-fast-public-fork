@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -7,8 +7,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::config::Config;
-use crate::delegate::OpDelegate;
-use crate::store::Store;
+use crate::fetch::Fetcher;
 use crate::template;
 
 const MASK: &str = "<concealed by 1Password>";
@@ -64,24 +63,46 @@ pub struct RunArgs {
     pub no_masking: bool,
 
     #[clap(
+        long = "refresh",
+        help = "Bypass the cache, fetch from 1Password, and overwrite cached entries"
+    )]
+    pub refresh: bool,
+
+    #[clap(
         trailing_var_arg = true,
-        allow_hyphen_values = true,
         help = "Command to run (use -- to separate flags)"
     )]
     pub command: Vec<String>,
 }
 
-pub fn execute(args: RunArgs) -> Result<()> {
+pub fn execute(args: RunArgs, sa: Option<&str>) -> Result<()> {
     if args.command.is_empty() {
         anyhow::bail!("No command specified");
     }
 
-    let mut env_vars: HashMap<String, String> = HashMap::new();
-
-    for (key, value) in std::env::vars() {
-        env_vars.insert(key, value);
+    // Precedence: --env-file entries over the inherited environment.
+    // An inherited value is a secret reference only when the whole value
+    // (trimmed) is one `op://vault/item/field` reference; its variables are
+    // then expanded strictly. Every other inherited value reaches the child
+    // byte-for-byte. Env-file values are variable-expanded, and references
+    // embedded in larger values are resolved, as before.
+    let mut with_refs: BTreeMap<String, String> = BTreeMap::new();
+    for (key, value) in std::env::vars_os() {
+        if let (Some(key), Some(value)) = (key.to_str(), value.to_str()) {
+            if template::is_whole_reference(value) {
+                let expanded = template::expand_reference(value.trim())?;
+                with_refs.insert(key.to_string(), expanded);
+            } else if template::looks_like_overlong_reference(value) {
+                // Name only; never print the value.
+                eprintln!(
+                    "op-fast: note: {} looks like a secret reference but is not valid; passed through unchanged",
+                    key
+                );
+            }
+        }
     }
 
+    let mut overrides: BTreeMap<String, String> = BTreeMap::new();
     for env_file in &args.env_files {
         if env_file.exists() {
             let contents = std::fs::read_to_string(env_file)?;
@@ -98,149 +119,264 @@ pub fn execute(args: RunArgs) -> Result<()> {
                         .and_then(|v| v.strip_suffix('"'))
                         .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
                         .unwrap_or(value);
-                    env_vars.insert(key.to_string(), value.to_string());
+                    let expanded = template::expand_text(value, true)?;
+                    if expanded.contains("op://") {
+                        with_refs.insert(key.to_string(), expanded.clone());
+                    } else {
+                        with_refs.remove(key);
+                    }
+                    overrides.insert(key.to_string(), expanded);
                 }
             }
         }
     }
 
-    let mut all_refs: Vec<String> = Vec::new();
-
-    for value in env_vars.values() {
-        all_refs.extend(template::extract_references(value));
-    }
-
-    for arg in &args.command {
-        all_refs.extend(template::extract_references(arg));
-    }
-
-    let references: Vec<String> = all_refs
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>()
+    let references: Vec<String> = with_refs
+        .values()
+        .flat_map(|v| template::extract_references(v))
+        .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-
-    let config = Config::load()?;
-    let store = Store::open();
-    let delegate = OpDelegate::new()?;
-
-    let mut stored_values: HashMap<String, String> = HashMap::new();
-    let mut uncached_refs: Vec<&str> = Vec::new();
-
-    match &store {
-        Ok(store) => {
-            for ref_str in &references {
-                match store.get_with_meta(ref_str)? {
-                    Some((value, meta)) => {
-                        crate::audit::record(
-                            "run",
-                            Some(ref_str),
-                            "hit",
-                            Some(meta.remaining_secs()),
-                            None,
-                        );
-                        stored_values.insert(ref_str.clone(), value);
-                    }
-                    None => {
-                        uncached_refs.push(ref_str);
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            log::error!("Store unavailable: {}", e);
-            uncached_refs = references.iter().map(|s| s.as_str()).collect();
-        }
+    for r in &references {
+        template::validate_reference(r)?;
     }
 
-    if !uncached_refs.is_empty() {
-        log::debug!("Fetching {} uncached references", uncached_refs.len());
-        let fetched = delegate.read_batch(&uncached_refs).inspect_err(|_| {
-            crate::audit::record("run", None, "error", None, None);
-        })?;
-        for ref_str in &uncached_refs {
-            crate::audit::record("run", Some(ref_str), "fetched", None, None);
-        }
-
-        if let Ok(store) = &store {
-            for (ref_str, value) in &fetched {
-                let ttl = config.resolve_ttl(ref_str);
-                store.put(ref_str, value, ttl)?;
-            }
-        }
-
-        stored_values.extend(fetched);
-    }
+    let stored_values: HashMap<String, String> = if references.is_empty() {
+        HashMap::new()
+    } else {
+        let config = Config::load()?;
+        let fetcher = Fetcher::new(&config, sa, "run")?;
+        fetcher.resolve(&references, args.refresh)?
+    };
 
     let resolver = |ref_str: &str| stored_values.get(ref_str).cloned();
-
-    let mut resolved_env: HashMap<String, String> = HashMap::new();
-    for (key, value) in &env_vars {
-        let resolved = template::resolve_variables(value);
-        let substituted = template::substitute_references(&resolved, resolver);
-        resolved_env.insert(key.clone(), substituted);
+    for (key, value) in &with_refs {
+        overrides.insert(
+            key.clone(),
+            template::substitute_references(value, resolver),
+        );
     }
 
-    let command_args: Vec<String> = args
+    // The child's argv is passed through untouched: secrets reach it only
+    // through its environment (like `op run`), never by op-fast expanding
+    // variables or references inside arguments.
+    let (program, cmd_args) = args
         .command
-        .iter()
-        .map(|arg| {
-            let resolved = template::resolve_variables(arg);
-            template::substitute_references(&resolved, resolver)
-        })
-        .collect();
-
-    let (program, cmd_args) = command_args
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("Empty command"))?;
 
-    let secrets: Vec<String> = stored_values.into_values().collect();
+    let secrets = mask_patterns(stored_values.values());
 
     if args.no_masking {
         let status = std::process::Command::new(program)
             .args(cmd_args)
-            .envs(&resolved_env)
+            .envs(&overrides)
             .status()?;
-        std::process::exit(status.code().unwrap_or(1));
+        std::process::exit(exit_code(status));
     }
 
     let mut child = std::process::Command::new(program)
         .args(cmd_args)
-        .envs(&resolved_env)
+        .envs(&overrides)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
+    let mut readers = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let secrets = secrets.clone();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                println!("{}", mask_secrets(&line, &secrets));
-            }
-        });
+        readers.push(std::thread::spawn(move || {
+            copy_masked(stdout, std::io::stdout(), &secrets)
+        }));
     }
-
     if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                eprintln!("{}", mask_secrets(&line, &secrets));
-            }
-        });
+        let secrets = secrets.clone();
+        readers.push(std::thread::spawn(move || {
+            copy_masked(stderr, std::io::stderr(), &secrets)
+        }));
     }
 
     let status = child.wait()?;
-    std::process::exit(status.code().unwrap_or(1));
+    // Drain every byte before exiting.
+    for reader in readers {
+        let _ = reader.join();
+    }
+    std::process::exit(exit_code(status));
 }
 
-fn mask_secrets(input: &str, secrets: &[String]) -> String {
-    let mut result = input.to_string();
-    for secret in secrets {
-        if secret.is_empty() {
+/// The child's exit code, or `128 + signal` when a signal killed it.
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => code,
+        (None, Some(sig)) => 128 + sig,
+        _ => 1,
+    }
+}
+
+/// Byte patterns to mask: every secret, plus each line (4+ characters) of a
+/// multi-line secret, longest first so a shorter secret that is a substring
+/// of a longer one cannot expose the longer one's remainder.
+fn mask_patterns<'a>(values: impl Iterator<Item = &'a String>) -> Vec<Vec<u8>> {
+    let mut patterns: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    for value in values {
+        if value.is_empty() {
             continue;
         }
-        result = result.replace(secret, MASK);
+        patterns.insert(value.as_bytes().to_vec());
+        if value.contains('\n') {
+            for line in value.split('\n') {
+                let line = line.trim_end_matches('\r');
+                if line.chars().count() >= 4 {
+                    patterns.insert(line.as_bytes().to_vec());
+                }
+            }
+        }
     }
-    result
+    let mut patterns: Vec<Vec<u8>> = patterns.into_iter().collect();
+    patterns.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    patterns
+}
+
+/// Copy `input` to `output` line by line as raw bytes (invalid UTF-8 is
+/// preserved), replacing every secret with the mask.
+fn copy_masked<R: std::io::Read, W: Write>(input: R, mut output: W, secrets: &[Vec<u8>]) {
+    let mut reader = BufReader::new(input);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let masked = mask_bytes(&line, secrets);
+                if output.write_all(&masked).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = output.flush();
+}
+
+/// Replace every occurrence of every secret with the mask in one pass:
+/// all match ranges are found on the original bytes, overlapping and
+/// adjacent ranges are merged, and each merged range is replaced once. Text
+/// that was already masked is never matched again.
+fn mask_bytes(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for secret in secrets {
+        if secret.is_empty() || secret.len() > input.len() {
+            continue;
+        }
+        for start in 0..=input.len() - secret.len() {
+            if input[start..].starts_with(secret) {
+                ranges.push((start, start + secret.len()));
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return input.to_vec();
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut out = Vec::with_capacity(input.len());
+    let mut pos = 0;
+    for (start, end) in merged {
+        out.extend_from_slice(&input[pos..start]);
+        out.extend_from_slice(MASK.as_bytes());
+        pos = end;
+    }
+    out.extend_from_slice(&input[pos..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masks_secrets_and_keeps_invalid_utf8() {
+        let secrets = vec![b"s3cr3t".to_vec()];
+        assert_eq!(
+            mask_bytes(b"a s3cr3t b \xff s3cr3t\n", &secrets),
+            b"a <concealed by 1Password> b \xff <concealed by 1Password>\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn multi_line_secrets_mask_every_line_and_longest_first() {
+        let pem = "-----BEGIN KEY-----\nabcdefgh\nxy\n-----END KEY-----".to_string();
+        let short = "BEGIN".to_string();
+        let patterns = mask_patterns([pem.clone(), short].iter());
+        assert!(patterns.windows(2).all(|w| w[0].len() >= w[1].len()));
+        let line = mask_bytes(b"leak: abcdefgh\n", &patterns);
+        assert_eq!(line, b"leak: <concealed by 1Password>\n".to_vec());
+        // "xy" is under 4 characters and stays as is.
+        assert_eq!(mask_bytes(b"xy\n", &patterns), b"xy\n".to_vec());
+        // The longer line wins over the substring secret "BEGIN".
+        assert_eq!(
+            mask_bytes(b"-----BEGIN KEY-----\n", &patterns),
+            b"<concealed by 1Password>\n".to_vec()
+        );
+    }
+
+    fn masked(line: &str, values: &[&str]) -> String {
+        let values: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+        let patterns = mask_patterns(values.iter());
+        String::from_utf8(mask_bytes(line.as_bytes(), &patterns)).unwrap()
+    }
+
+    #[test]
+    fn b8_line_pattern_before_another_secret_does_not_hide_it() {
+        assert_eq!(
+            masked(
+                "FAKEPEMHEAD-12345abcdefSECRET",
+                &["FAKEPEMHEAD-12345ab\nFAKE-PEM-LINE-2", "abcdefSECRET"]
+            ),
+            "<concealed by 1Password>"
+        );
+    }
+
+    #[test]
+    fn b8_patterns_never_match_inside_inserted_mask_text() {
+        for word in ["word", "concealed", "1Password"] {
+            let values = [&*format!("{}\nother-line", word), "s3cr3t-value"];
+            let out = masked("x s3cr3t-value y", &values);
+            assert_eq!(out, "x <concealed by 1Password> y", "{}", word);
+        }
+    }
+
+    #[test]
+    fn b8_overlapping_and_prefix_secrets_mask_once() {
+        assert_eq!(
+            masked("aaXXXXbbbbYY", &["XXXXbb", "bbbbYY"]),
+            "aa<concealed by 1Password>"
+        );
+        assert_eq!(
+            masked("key=TOKEN123456", &["TOKEN", "TOKEN123456"]),
+            "key=<concealed by 1Password>"
+        );
+        assert_eq!(
+            masked("TOKEN and TOKEN123", &["TOKEN123", "TOKEN"]),
+            "<concealed by 1Password> and <concealed by 1Password>"
+        );
+        assert_eq!(masked("abcabc", &["abc"]), "<concealed by 1Password>");
+    }
+
+    #[test]
+    fn copy_masked_is_lossless() {
+        let input: Vec<u8> = (0..20000u32)
+            .flat_map(|n| format!("{}\n", n).into_bytes())
+            .chain(b"\xff\xfe tail without newline".iter().copied())
+            .collect();
+        let mut out = Vec::new();
+        copy_masked(&input[..], &mut out, &[]);
+        assert_eq!(out, input);
+    }
 }
